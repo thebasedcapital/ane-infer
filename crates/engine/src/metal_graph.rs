@@ -46,10 +46,21 @@ enum GraphOp {
 
 /// Metal GPU context with persistent resources.
 pub struct GpuContext {
-    device: Device,
-    queue: CommandQueue,
-    gemv_pipeline: ComputePipelineState,
-    silu_pipeline: ComputePipelineState,
+    pub device: Device,
+    pub queue: CommandQueue,
+    pub gemv_pipeline: ComputePipelineState,
+    pub silu_pipeline: ComputePipelineState,
+    // DeltaNet recurrence shaders
+    pub conv1d_silu_pipeline: ComputePipelineState,
+    pub l2_norm_scale_pipeline: ComputePipelineState,
+    pub deltanet_recurrence_pipeline: ComputePipelineState,
+    pub compute_beta_decay_pipeline: ComputePipelineState,
+    pub rmsnorm_gated_pipeline: ComputePipelineState,
+    pub rmsnorm_simple_pipeline: ComputePipelineState,
+    pub residual_add_pipeline: ComputePipelineState,
+    pub gpu_memcpy_pipeline: ComputePipelineState,
+    pub silu_inplace_pipeline: ComputePipelineState,
+    // Scratch buffers
     scratch_input: Buffer,
     scratch_output: Buffer,
     scratch_input_size: usize,
@@ -78,6 +89,24 @@ impl GpuContext {
             .new_compute_pipeline_state_with_function(&silu_fn)
             .map_err(|e| anyhow::anyhow!("silu_mul pipeline creation failed: {e}"))?;
 
+        // Load DeltaNet recurrence shaders
+        let load_pipeline = |name: &str| -> Result<ComputePipelineState> {
+            let f = library.get_function(name, None)
+                .map_err(|e| anyhow::anyhow!("{name} not found: {e}"))?;
+            device.new_compute_pipeline_state_with_function(&f)
+                .map_err(|e| anyhow::anyhow!("{name} pipeline failed: {e}"))
+        };
+
+        let conv1d_silu_pipeline = load_pipeline("conv1d_silu")?;
+        let l2_norm_scale_pipeline = load_pipeline("l2_normalize_scale")?;
+        let deltanet_recurrence_pipeline = load_pipeline("deltanet_recurrence")?;
+        let compute_beta_decay_pipeline = load_pipeline("compute_beta_decay")?;
+        let rmsnorm_gated_pipeline = load_pipeline("rmsnorm_gated")?;
+        let rmsnorm_simple_pipeline = load_pipeline("rmsnorm_simple")?;
+        let residual_add_pipeline = load_pipeline("residual_add")?;
+        let gpu_memcpy_pipeline = load_pipeline("gpu_memcpy")?;
+        let silu_inplace_pipeline = load_pipeline("silu_inplace")?;
+
         let scratch_input_size = 128 * 1024;
         let scratch_output_size = 4 * 1024 * 1024;
 
@@ -95,6 +124,15 @@ impl GpuContext {
             queue,
             gemv_pipeline,
             silu_pipeline,
+            conv1d_silu_pipeline,
+            l2_norm_scale_pipeline,
+            deltanet_recurrence_pipeline,
+            compute_beta_decay_pipeline,
+            rmsnorm_gated_pipeline,
+            rmsnorm_simple_pipeline,
+            residual_add_pipeline,
+            gpu_memcpy_pipeline,
+            silu_inplace_pipeline,
             scratch_input,
             scratch_output,
             scratch_input_size,
