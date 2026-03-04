@@ -44,29 +44,48 @@ int main() {
         int CH = 64, SP = 32;
         int ioBytes = CH * SP * 4;
 
-        // ── Build single-procedure identity conv model ──
+        // ── Build DUAL-procedure identity conv model (council says chaining needs ≥2 procs) ──
         NSString *mil = [NSString stringWithFormat:
             @"program(1.3)\n"
             "[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, "
             "{\"coremlc-version\", \"3505.4.1\"}, {\"coremltools-component-milinternal\", \"\"}, "
             "{\"coremltools-version\", \"9.0\"}})]\n"
             "{\n"
-            "    func main<ios18>(tensor<fp32, [1, %d, 1, %d]> x) {\n"
-            "        string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n"
-            "        tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];\n"
-            "        tensor<int32, [4]> pd = const()[name=string(\"pd\"), val=tensor<int32, [4]>([0,0,0,0])];\n"
-            "        tensor<int32, [2]> dl = const()[name=string(\"dl\"), val=tensor<int32, [2]>([1,1])];\n"
-            "        int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n"
-            "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];\n"
-            "        tensor<fp16, [1,%d,1,%d]> x16 = cast(dtype=to16,x=x)[name=string(\"cin\")];\n"
-            "        tensor<fp16, [%d,%d,1,1]> W = const()[name=string(\"W\"), "
+            "    func layer0<ios18>(tensor<fp32, [1, %d, 1, %d]> x0) {\n"
+            "        string pt0 = const()[name=string(\"pt0\"), val=string(\"valid\")];\n"
+            "        tensor<int32, [2]> st0 = const()[name=string(\"st0\"), val=tensor<int32, [2]>([1,1])];\n"
+            "        tensor<int32, [4]> pd0 = const()[name=string(\"pd0\"), val=tensor<int32, [4]>([0,0,0,0])];\n"
+            "        tensor<int32, [2]> dl0 = const()[name=string(\"dl0\"), val=tensor<int32, [2]>([1,1])];\n"
+            "        int32 gr0 = const()[name=string(\"gr0\"), val=int32(1)];\n"
+            "        string to16_0 = const()[name=string(\"to16_0\"), val=string(\"fp16\")];\n"
+            "        tensor<fp16, [1,%d,1,%d]> x16_0 = cast(dtype=to16_0,x=x0)[name=string(\"cin0\")];\n"
+            "        tensor<fp16, [%d,%d,1,1]> W0 = const()[name=string(\"W0\"), "
             "val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/weight.bin\"), offset=uint64(64)))];\n"
-            "        tensor<fp16, [1,%d,1,%d]> y16 = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W,x=x16)"
-            "[name=string(\"conv\")];\n"
-            "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];\n"
-            "        tensor<fp32, [1,%d,1,%d]> y = cast(dtype=to32,x=y16)[name=string(\"cout\")];\n"
-            "    } -> (y);\n"
+            "        tensor<fp16, [1,%d,1,%d]> y16_0 = conv(dilations=dl0,groups=gr0,pad=pd0,pad_type=pt0,strides=st0,weight=W0,x=x16_0)"
+            "[name=string(\"conv0\")];\n"
+            "        string to32_0 = const()[name=string(\"to32_0\"), val=string(\"fp32\")];\n"
+            "        tensor<fp32, [1,%d,1,%d]> y0 = cast(dtype=to32_0,x=y16_0)[name=string(\"cout0\")];\n"
+            "    } -> (y0);\n"
+            "\n"
+            "    func layer1<ios18>(tensor<fp32, [1, %d, 1, %d]> x1) {\n"
+            "        string pt1 = const()[name=string(\"pt1\"), val=string(\"valid\")];\n"
+            "        tensor<int32, [2]> st1 = const()[name=string(\"st1\"), val=tensor<int32, [2]>([1,1])];\n"
+            "        tensor<int32, [4]> pd1 = const()[name=string(\"pd1\"), val=tensor<int32, [4]>([0,0,0,0])];\n"
+            "        tensor<int32, [2]> dl1 = const()[name=string(\"dl1\"), val=tensor<int32, [2]>([1,1])];\n"
+            "        int32 gr1 = const()[name=string(\"gr1\"), val=int32(1)];\n"
+            "        string to16_1 = const()[name=string(\"to16_1\"), val=string(\"fp16\")];\n"
+            "        tensor<fp16, [1,%d,1,%d]> x16_1 = cast(dtype=to16_1,x=x1)[name=string(\"cin1\")];\n"
+            "        tensor<fp16, [%d,%d,1,1]> W1 = const()[name=string(\"W1\"), "
+            "val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/weight.bin\"), offset=uint64(64)))];\n"
+            "        tensor<fp16, [1,%d,1,%d]> y16_1 = conv(dilations=dl1,groups=gr1,pad=pd1,pad_type=pt1,strides=st1,weight=W1,x=x16_1)"
+            "[name=string(\"conv1\")];\n"
+            "        string to32_1 = const()[name=string(\"to32_1\"), val=string(\"fp32\")];\n"
+            "        tensor<fp32, [1,%d,1,%d]> y1 = cast(dtype=to32_1,x=y16_1)[name=string(\"cout1\")];\n"
+            "    } -> (y1);\n"
             "}\n",
+            // layer0
+            CH, SP, CH, SP, CH, CH, CH, CH, CH, SP, CH, SP,
+            // layer1
             CH, SP, CH, SP, CH, CH, CH, CH, CH, SP, CH, SP];
 
         // Identity weights
@@ -156,10 +175,34 @@ int main() {
             id outputSets = ((id(*)(Class,SEL,IOSurfaceRef,id))objc_msgSend)(g_OutputSets,
                 @selector(objectWithstatsSurRef:outputBuffer:), ioStats, @[buf_out]);
 
-            // Step 1: Prepare chaining
+            // Build second output set for procedure 1
+            IOSurfaceRef ioOut2 = make_surface(ioBytes);
+            IOSurfaceRef ioStats2 = make_surface(4096);
+            id ioObj_out2 = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), ioOut2);
+            id buf_out2 = ((id(*)(Class,SEL,id,id,long long))objc_msgSend)(g_Buffer,
+                @selector(bufferWithIOSurfaceObject:symbolIndex:source:), ioObj_out2, @0, (long long)1);
+            id outputSets2 = ((id(*)(Class,SEL,IOSurfaceRef,id))objc_msgSend)(g_OutputSets,
+                @selector(objectWithstatsSurRef:outputBuffer:), ioStats2, @[buf_out2]);
+
+            // Step 0: Map IOSurfaces BEFORE preparing chaining
+            {
+                id wI = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), ioIn);
+                id wO = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), ioOut);
+                id mapReq = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(g_AR,
+                    @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+                    @[wI], @[@0], @[wO], @[@0], nil, nil, @0);
+                e = nil;
+                BOOL mapOk = ((BOOL(*)(id,SEL,id,BOOL,NSError**))objc_msgSend)(
+                    mdl, @selector(mapIOSurfacesWithRequest:cacheInference:error:), mapReq, NO, &e);
+                printf("  0. mapIOSurfaces (before prepare): %s", mapOk ? "OK" : "FAIL");
+                if (!mapOk && e) printf(" err=%ld", (long)[e code]);
+                printf("\n");
+            }
+
+            // Step 1: Prepare chaining — dual-procedure with loopback (output 0 → input 1)
             id cr = ((id(*)(Class,SEL,id,id,id,id,id,id,id,id,id))objc_msgSend)(g_ChainingReq,
                 @selector(chainingRequestWithInputs:outputSets:lbInputSymbolId:lbOutputSymbolId:procedureIndex:signalEvents:transactionHandle:fwEnqueueDelay:memoryPoolId:),
-                @[buf_in], @[outputSets], @[], @[], @0, @[], @0, @0, @0);
+                @[buf_in], @[outputSets, outputSets2], @[@0], @[@0], @0, @[], @1, @0, @0);
 
             e = nil;
             BOOL ok = ((BOOL(*)(id,SEL,id,id,id,unsigned int,NSError**))objc_msgSend)(
@@ -177,6 +220,26 @@ int main() {
                 printf("  2. inputBuffersReady created: %s\n", inputReady ? "OK" : "nil");
 
                 // Try multiple variations
+                // Map IOSurfaces on the model (discovered: mapIOSurfacesWithRequest:cacheInference:error: on _ANEInMemoryModel)
+                // Build a normal _ANERequest for the mapping
+                id wI = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), ioIn);
+                id wO = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), ioOut);
+                id mapReq = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(g_AR,
+                    @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+                    @[wI], @[@0], @[wO], @[@0], nil, nil, @0);
+
+                @try {
+                    e = nil;
+                    BOOL mapOk = ((BOOL(*)(id,SEL,id,BOOL,NSError**))objc_msgSend)(
+                        mdl, @selector(mapIOSurfacesWithRequest:cacheInference:error:),
+                        mapReq, YES, &e);
+                    printf("     mapIOSurfaces(model): %s", mapOk ? "OK" : "FAIL");
+                    if (!mapOk && e) printf(" err=%ld", (long)[e code]);
+                    printf("\n");
+                } @catch (NSException *ex) {
+                    printf("     mapIOSurfaces: EXCEPTION %s\n", [[ex reason] UTF8String]);
+                }
+
                 // Variation A: doBuffersReady with _ANEModel — use NSError** properly
                 NSError *berr = nil;
                 @try {
