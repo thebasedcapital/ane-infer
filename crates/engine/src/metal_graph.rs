@@ -316,8 +316,11 @@ impl<'a> GpuGraph<'a> {
         Ok(())
     }
 
-    /// Execute with params buffer reuse (more efficient for repeated calls).
-    pub fn execute_with_params(&self, params_buf: &Buffer) -> Result<()> {
+    /// Execute with per-op params buffers.
+    /// CRITICAL FIX: Previously shared one params_buf across all ops,
+    /// causing later ops to overwrite earlier ops' params before GPU reads them.
+    /// Now each op gets its own inline params via setBytes or separate buffer.
+    pub fn execute_with_params(&self, _params_buf: &Buffer) -> Result<()> {
         if self.ops.is_empty() {
             return Ok(());
         }
@@ -330,11 +333,13 @@ impl<'a> GpuGraph<'a> {
                     let m = op.weight_buffer.m as u32;
                     let n_blocks = op.weight_buffer.n_blocks;
 
-                    unsafe {
-                        let ptr = params_buf.contents() as *mut u32;
-                        *ptr = n_blocks;
-                        *ptr.add(1) = m;
-                    }
+                    // Each op gets its own params buffer — critical for correctness
+                    // when multiple GEMVs with different m/n_blocks are in one command buffer
+                    let op_params = self.ctx.device.new_buffer_with_data(
+                        [n_blocks, m].as_ptr() as *const _,
+                        8,
+                        MTLResourceOptions::StorageModeShared,
+                    );
 
                     let encoder = cmd_buf.new_compute_command_encoder();
 
@@ -350,10 +355,9 @@ impl<'a> GpuGraph<'a> {
                         Some(&self.ctx.scratch_output),
                         (op.output_offset * 4) as u64,
                     );
-                    encoder.set_buffer(3, Some(params_buf), 0);
-                    encoder.set_buffer(4, Some(params_buf), 4);
+                    encoder.set_buffer(3, Some(&op_params), 0);
+                    encoder.set_buffer(4, Some(&op_params), 4);
 
-                    // New shader: one threadgroup per row, 128 threads per threadgroup
                     let tg_count = MTLSize::new(m as u64, 1, 1);
                     let tg_size = MTLSize::new(128, 1, 1);
                     encoder.dispatch_thread_groups(tg_count, tg_size);
@@ -361,6 +365,12 @@ impl<'a> GpuGraph<'a> {
                 }
                 GraphOp::SiluMul(op) => {
                     let n = op.n as u32;
+                    let n_buf = self.ctx.device.new_buffer_with_data(
+                        &n as *const u32 as *const _,
+                        4,
+                        MTLResourceOptions::StorageModeShared,
+                    );
+
                     let encoder = cmd_buf.new_compute_command_encoder();
                     encoder.set_compute_pipeline_state(&self.ctx.silu_pipeline);
                     encoder.set_buffer(
@@ -373,12 +383,7 @@ impl<'a> GpuGraph<'a> {
                         Some(&self.ctx.scratch_output),
                         (op.up_offset * 4) as u64,
                     );
-                    // Reuse params_buf bytes 0..4 for n (write u32 n there temporarily)
-                    unsafe {
-                        let ptr = params_buf.contents() as *mut u32;
-                        *ptr = n;
-                    }
-                    encoder.set_buffer(2, Some(params_buf), 0);
+                    encoder.set_buffer(2, Some(&n_buf), 0);
                     let threads = MTLSize::new(n as u64, 1, 1);
                     let tg_size = MTLSize::new(
                         self.ctx.silu_pipeline.thread_execution_width().min(n as u64),

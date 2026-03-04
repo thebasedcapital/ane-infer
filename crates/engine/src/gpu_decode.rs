@@ -383,7 +383,14 @@ pub fn qwen35_forward_token_gpu(
                     );
                 }
 
-                // Gate + up projections, then fused SiLU(gate)*up on GPU — no CPU roundtrip.
+                // FFN: gate + up + SiLU + down — ALL in ONE GPU dispatch
+                // The key insight: SiLU output goes to gate_offset in scratch_output,
+                // but down_proj reads from input scratch. So we need a copy between
+                // SiLU output → input scratch. Use GPU-side copy or accept the roundtrip.
+                // For now: 2-step (gate+up+SiLU, then down) is necessary because
+                // the down_proj reads from input_offset which is in scratch_input,
+                // while SiLU writes to scratch_output.
+                // TODO: If we add a GPU memcpy op, we can merge into 1 execute.
                 graph.clear();
                 graph.add_gemv(GemvOp {
                     weight_buffer: gw.ffn_gate.clone_buffer(),
@@ -406,7 +413,7 @@ pub fn qwen35_forward_token_gpu(
                 });
                 graph.execute_with_params(&params_buf)?;
 
-                // Copy GPU-fused result (gate now holds SiLU(gate)*up) directly into input.
+                // Copy SiLU result from output scratch → input scratch for down_proj
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         output_ptr.add(layout.output_ffn_gate),
