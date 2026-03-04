@@ -252,3 +252,28 @@ mod tests {
         assert!(mil.contains("-> (q, k, v)"));
     }
 }
+
+    #[test]
+    fn test_fused_ffn_small() {
+        // Test with small dimensions to verify compilation
+        let mil = mil_gen_fused_ffn(64, 128, 16);
+        assert!(mil.contains("sigmoid"));
+        assert!(mil.contains("conv_gate"));
+        assert!(mil.contains("conv_down"));
+        // Check offsets
+        let cs = 64 + 128 * 64 * 2; // 64 + 16384 = 16448
+        let up_off = 64 + cs as u64;
+        let down_off = 64 + cs as u64 + cs as u64;
+        assert!(mil.contains(&format!("offset = uint64(64)")));
+        assert!(mil.contains(&format!("offset = uint64({up_off})")));
+        assert!(mil.contains(&format!("offset = uint64({down_off})")));
+    }
+
+    #[test]
+    fn test_fused_gate_up_small() {
+        let mil = mil_gen_fused_ffn_gate_up(64, 128, 16);
+        assert!(mil.contains("sigmoid"));
+        assert!(mil.contains("conv_gate"));
+        assert!(mil.contains("conv_up"));
+        assert!(!mil.contains("conv_down")); // no down_proj in gate_up version
+    }

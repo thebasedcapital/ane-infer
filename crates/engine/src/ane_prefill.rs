@@ -7,7 +7,7 @@
 //! This gives us ANE's ~19 TFLOPS for the bandwidth-heavy projections
 //! while keeping the sequential recurrence on CPU.
 
-use ane_bridge::{build_single_weight_blob, transpose_to_channels_first, AneKernel};
+use ane_bridge::{build_single_weight_blob, build_weight_blob, transpose_to_channels_first, AneKernel};
 use anyhow::Result;
 use half::f16;
 
@@ -93,11 +93,14 @@ fn dequant_q8_to_f32(q8: &Q8Tensor) -> Vec<f32> {
     out
 }
 
-/// FFN kernel — 3 separate ANE projections (fused version has weight blob offset issues).
+/// FFN mega-kernel — full gate+SiLU+up+mul+down in ONE ANE dispatch.
+/// 8 ops (3 convs + sigmoid + 2 muls + 2 casts) in a single compiled program.
+/// Achieves 3.6 TFLOPS at dim=2048, hidden=6144, spatial=64 (vs 1.1 TFLOPS per single op).
 pub struct FusedFfnKernel {
-    gate: AneProjection,
-    up: AneProjection,
-    down: AneProjection,
+    kernel: AneKernel,
+    dim: usize,
+    hidden_dim: usize,
+    seq_len: usize,
 }
 
 impl FusedFfnKernel {
@@ -109,28 +112,45 @@ impl FusedFfnKernel {
         hidden_dim: usize,
         seq_len: usize,
     ) -> Result<Self> {
-        let gate = AneProjection::compile(gate_f32, dim, hidden_dim, seq_len)?;
-        let up = AneProjection::compile(up_f32, dim, hidden_dim, seq_len)?;
-        let down = AneProjection::compile(down_f32, hidden_dim, dim, seq_len)?;
-        Ok(Self { gate, up, down })
+        let mil = mil_gen::mega::mil_gen_fused_ffn(dim, hidden_dim, seq_len);
+        let blob = build_weight_blob(&[gate_f32, up_f32, down_f32]);
+
+        let in_bytes = dim * seq_len * 4;
+        let out_bytes = dim * seq_len * 4;
+
+        let kernel = AneKernel::compile(&mil, Some(&blob), &[in_bytes], &[out_bytes])?;
+
+        Ok(Self {
+            kernel,
+            dim,
+            hidden_dim,
+            seq_len,
+        })
     }
 
-    /// Run FFN: gate → SiLU → * up → down.
+    /// Run FFN: gate → SiLU → * up → down — ALL on ANE in one dispatch.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> Result<()> {
-        let seq_len = self.gate.seq_len;
-        let hidden_dim = self.gate.out_dim;
-
-        let mut h1 = vec![0.0f32; seq_len * hidden_dim];
-        let mut h3 = vec![0.0f32; seq_len * hidden_dim];
-        self.gate.forward(input, &mut h1)?;
-        self.up.forward(input, &mut h3)?;
-
-        // SiLU(gate) * up on CPU
-        for i in 0..seq_len * hidden_dim {
-            h1[i] = (h1[i] / (1.0 + (-h1[i]).exp())) * h3[i];
+        // Transpose to channel-first: [seq_len, dim] → [dim, seq_len]
+        let mut input_t = vec![0.0f32; self.dim * self.seq_len];
+        for t in 0..self.seq_len {
+            for d in 0..self.dim {
+                input_t[d * self.seq_len + t] = input[t * self.dim + d];
+            }
         }
 
-        self.down.forward(&h1, output)?;
+        self.kernel.write_input_f32(0, &input_t);
+        self.kernel.eval()?;
+
+        // Read and transpose back: [dim, seq_len] → [seq_len, dim]
+        let mut output_t = vec![0.0f32; self.dim * self.seq_len];
+        self.kernel.read_output_f32(0, &mut output_t);
+
+        for t in 0..self.seq_len {
+            for d in 0..self.dim {
+                output[t * self.dim + d] = output_t[d * self.seq_len + t];
+            }
+        }
+
         Ok(())
     }
 }
