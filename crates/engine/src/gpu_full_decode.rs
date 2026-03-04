@@ -32,6 +32,72 @@ pub struct GpuLayerScratch {
     pub hidden: Buffer,       // [dim] — residual hidden state
 }
 
+/// Pre-allocated constant pool for all shader dispatch params.
+/// Written once at init, never changes between tokens.
+pub struct GpuConstantPool {
+    pub buf: Buffer,
+}
+
+impl GpuConstantPool {
+    // Layout (all u32 unless noted):
+    // 0: dim
+    // 4: inner_size
+    // 8: hidden_dim
+    // 12: n_heads
+    // 16: head_dim_k (chunk / n_heads)
+    // 20: chunk (inner_size / 3)
+    // 24: eps (f32)
+    // 28: key_dim
+    // 32: value_dim
+    // 36: v_per_head (chunk / n_heads)
+    // 40: kernel_size
+    // 44: scale (1/sqrt(key_dim), f32)
+    // 48: scale_1 (1.0f32)
+    // 52: has_gate (1u32)
+    // 56: zero (0u32)
+    pub const DIM: usize = 0;
+    pub const INNER_SIZE: usize = 4;
+    pub const HIDDEN_DIM: usize = 8;
+    pub const N_HEADS: usize = 12;
+    pub const HEAD_DIM_K: usize = 16;
+    pub const CHUNK: usize = 20;
+    pub const EPS: usize = 24;
+    pub const KEY_DIM: usize = 28;
+    pub const VALUE_DIM: usize = 32;
+    pub const V_PER_HEAD: usize = 36;
+    pub const KERNEL_SIZE: usize = 40;
+    pub const SCALE: usize = 44;
+    pub const SCALE_1: usize = 48;
+    pub const HAS_GATE: usize = 52;
+    pub const ZERO: usize = 56;
+
+    pub fn new(device: &Device, dim: usize, hidden_dim: usize, inner_size: usize, n_heads: usize, key_dim: usize, kernel_size: usize, eps: f32) -> Self {
+        let buf = device.new_buffer(256, MTLResourceOptions::StorageModeShared);
+        let ptr = buf.contents() as *mut u32;
+        let chunk = inner_size / 3;
+        let head_dim_k = chunk / n_heads;
+        let scale = 1.0f32 / (key_dim as f32).sqrt();
+        unsafe {
+            *ptr.add(0) = dim as u32;
+            *ptr.add(1) = inner_size as u32;
+            *ptr.add(2) = hidden_dim as u32;
+            *ptr.add(3) = n_heads as u32;
+            *ptr.add(4) = head_dim_k as u32;
+            *ptr.add(5) = chunk as u32;
+            *(ptr.add(6) as *mut f32) = eps;
+            *ptr.add(7) = key_dim as u32;
+            *ptr.add(8) = key_dim as u32; // value_dim = key_dim
+            *ptr.add(9) = (chunk / n_heads) as u32;
+            *ptr.add(10) = kernel_size as u32;
+            *(ptr.add(11) as *mut f32) = scale;
+            *(ptr.add(12) as *mut f32) = 1.0f32;
+            *ptr.add(13) = 1u32; // has_gate
+            *ptr.add(14) = 0u32; // zero
+        }
+        Self { buf }
+    }
+}
+
 impl GpuLayerScratch {
     pub fn new(device: &Device, dim: usize, hidden_dim: usize, inner_size: usize, n_heads: usize) -> Self {
         let alloc = |n: usize| -> Buffer {
@@ -66,6 +132,7 @@ pub fn encode_full_token_gpu(
     model: &Qwen35ModelWeights,
     gpu_weights: &GpuModelWeights,
     scratch: &GpuLayerScratch,
+    cp: &GpuConstantPool,
     token_id: u32,
 ) -> Result<Vec<f32>> {
     let cfg = &model.config;
@@ -134,13 +201,9 @@ pub fn encode_full_token_gpu(
                     enc.set_compute_pipeline_state(&gpu.rmsnorm_simple_pipeline);
                     enc.set_buffer(0, Some(&scratch.hidden), 0);
                     enc.set_buffer(1, Some(&gw.attn_norm_buf), 0);
-                    enc.set_buffer(2, Some(&gpu.scratch_input), 0); // output → scratch_input[0]
-                    let dim_u32 = dim as u32;
-                    let eps_f32 = eps;
-                    let dim_buf = gpu.device.new_buffer_with_data(&dim_u32 as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    let eps_buf = gpu.device.new_buffer_with_data(&eps_f32 as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    enc.set_buffer(3, Some(&dim_buf), 0);
-                    enc.set_buffer(4, Some(&eps_buf), 0);
+                    enc.set_buffer(2, Some(&gpu.scratch_input), 0);
+                    enc.set_buffer(3, Some(&cp.buf), GpuConstantPool::DIM as u64);
+                    enc.set_buffer(4, Some(&cp.buf), GpuConstantPool::EPS as u64);
                     enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(128, 1, 1));
                     enc.end_encoding();
                 }
@@ -156,6 +219,8 @@ pub fn encode_full_token_gpu(
                 encode_gemv_prealloc(cmd_buf, gpu, &gw.ssm_alpha, &gpu.scratch_input, 0, &scratch.alpha_raw, 0, &gw.ssm_alpha_params);
 
                 // --- Conv1d + SiLU ---
+                // Write kernel_size to pool (may differ per layer)
+                unsafe { *(cp.buf.contents() as *mut u32).add(10) = kernel_size as u32; }
                 {
                     let enc = cmd_buf.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(&gpu.conv1d_silu_pipeline);
@@ -163,12 +228,8 @@ pub fn encode_full_token_gpu(
                     enc.set_buffer(1, Some(&gw.conv1d_buf), 0);
                     enc.set_buffer(2, Some(&scratch.qkv_out), 0);
                     enc.set_buffer(3, Some(&scratch.conv_out), 0);
-                    let is = inner_size as u32;
-                    let ks = kernel_size as u32;
-                    let is_buf = gpu.device.new_buffer_with_data(&is as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    let ks_buf = gpu.device.new_buffer_with_data(&ks as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    enc.set_buffer(4, Some(&is_buf), 0);
-                    enc.set_buffer(5, Some(&ks_buf), 0);
+                    enc.set_buffer(4, Some(&cp.buf), GpuConstantPool::INNER_SIZE as u64);
+                    enc.set_buffer(5, Some(&cp.buf), GpuConstantPool::KERNEL_SIZE as u64);
                     let tg = MTLSize::new(((inner_size + 255) / 256) as u64, 1, 1);
                     enc.dispatch_thread_groups(tg, MTLSize::new(256, 1, 1));
                     enc.end_encoding();
@@ -180,9 +241,7 @@ pub fn encode_full_token_gpu(
                     enc.set_compute_pipeline_state(&gpu.gpu_memcpy_pipeline);
                     enc.set_buffer(0, Some(&scratch.conv_out), 0);
                     enc.set_buffer(1, Some(&scratch.q), 0);
-                    let n = chunk as u32;
-                    let n_buf = gpu.device.new_buffer_with_data(&n as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    enc.set_buffer(2, Some(&n_buf), 0);
+                    enc.set_buffer(2, Some(&cp.buf), GpuConstantPool::CHUNK as u64);
                     enc.dispatch_threads(MTLSize::new(chunk as u64, 1, 1), MTLSize::new(256, 1, 1));
                     enc.end_encoding();
                 }
@@ -191,43 +250,29 @@ pub fn encode_full_token_gpu(
                     enc.set_compute_pipeline_state(&gpu.gpu_memcpy_pipeline);
                     enc.set_buffer(0, Some(&scratch.conv_out), (chunk * 4) as u64);
                     enc.set_buffer(1, Some(&scratch.k), 0);
-                    let n = chunk as u32;
-                    let n_buf = gpu.device.new_buffer_with_data(&n as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    enc.set_buffer(2, Some(&n_buf), 0);
+                    enc.set_buffer(2, Some(&cp.buf), GpuConstantPool::CHUNK as u64);
                     enc.dispatch_threads(MTLSize::new(chunk as u64, 1, 1), MTLSize::new(256, 1, 1));
                     enc.end_encoding();
                 }
 
                 // --- L2 normalize + scale Q and K ---
                 {
-                    let scale = 1.0f32 / (key_dim as f32).sqrt();
                     let enc = cmd_buf.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(&gpu.l2_norm_scale_pipeline);
                     enc.set_buffer(0, Some(&scratch.q), 0);
-                    let hd = head_dim_k as u32;
-                    let nh = n_heads as u32;
-                    let hd_buf = gpu.device.new_buffer_with_data(&hd as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    let nh_buf = gpu.device.new_buffer_with_data(&nh as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    let sc_buf = gpu.device.new_buffer_with_data(&scale as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    enc.set_buffer(1, Some(&hd_buf), 0);
-                    enc.set_buffer(2, Some(&nh_buf), 0);
-                    enc.set_buffer(3, Some(&sc_buf), 0);
+                    enc.set_buffer(1, Some(&cp.buf), GpuConstantPool::HEAD_DIM_K as u64);
+                    enc.set_buffer(2, Some(&cp.buf), GpuConstantPool::N_HEADS as u64);
+                    enc.set_buffer(3, Some(&cp.buf), GpuConstantPool::SCALE as u64);
                     enc.dispatch_thread_groups(MTLSize::new(n_heads as u64, 1, 1), MTLSize::new(32, 1, 1));
                     enc.end_encoding();
                 }
                 {
-                    let scale = 1.0f32; // K doesn't get the 1/sqrt(d) scale
                     let enc = cmd_buf.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(&gpu.l2_norm_scale_pipeline);
                     enc.set_buffer(0, Some(&scratch.k), 0);
-                    let hd = head_dim_k as u32;
-                    let nh = n_heads as u32;
-                    let hd_buf = gpu.device.new_buffer_with_data(&hd as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    let nh_buf = gpu.device.new_buffer_with_data(&nh as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    let sc_buf = gpu.device.new_buffer_with_data(&scale as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    enc.set_buffer(1, Some(&hd_buf), 0);
-                    enc.set_buffer(2, Some(&nh_buf), 0);
-                    enc.set_buffer(3, Some(&sc_buf), 0);
+                    enc.set_buffer(1, Some(&cp.buf), GpuConstantPool::HEAD_DIM_K as u64);
+                    enc.set_buffer(2, Some(&cp.buf), GpuConstantPool::N_HEADS as u64);
+                    enc.set_buffer(3, Some(&cp.buf), GpuConstantPool::SCALE_1 as u64); // K scale = 1.0
                     enc.dispatch_thread_groups(MTLSize::new(n_heads as u64, 1, 1), MTLSize::new(32, 1, 1));
                     enc.end_encoding();
                 }
@@ -242,9 +287,7 @@ pub fn encode_full_token_gpu(
                     enc.set_buffer(3, Some(&gw.dt_bias_buf), 0);
                     enc.set_buffer(4, Some(&scratch.beta), 0);
                     enc.set_buffer(5, Some(&scratch.decay), 0);
-                    let nh = n_heads as u32;
-                    let nh_buf = gpu.device.new_buffer_with_data(&nh as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    enc.set_buffer(6, Some(&nh_buf), 0);
+                    enc.set_buffer(6, Some(&cp.buf), GpuConstantPool::N_HEADS as u64);
                     enc.dispatch_threads(MTLSize::new(n_heads as u64, 1, 1), MTLSize::new(32, 1, 1));
                     enc.end_encoding();
                 }
@@ -256,17 +299,15 @@ pub fn encode_full_token_gpu(
                     enc.set_buffer(0, Some(&gw.recurrent_state_buf), 0);
                     enc.set_buffer(1, Some(&scratch.q), 0);
                     enc.set_buffer(2, Some(&scratch.k), 0);
-                    enc.set_buffer(3, Some(&scratch.conv_out), (2 * chunk * 4) as u64); // v starts at offset 2*chunk
+                    enc.set_buffer(3, Some(&scratch.conv_out), (2 * chunk * 4) as u64);
                     enc.set_buffer(4, Some(&scratch.decay), 0);
                     enc.set_buffer(5, Some(&scratch.beta), 0);
                     enc.set_buffer(6, Some(&scratch.output_heads), 0);
-                    let params: [u32; 5] = [n_heads as u32, key_dim as u32, value_dim as u32, head_dim_k as u32, v_per_head as u32];
-                    let p_buf = gpu.device.new_buffer_with_data(params.as_ptr() as *const _, 20, MTLResourceOptions::StorageModeShared);
-                    enc.set_buffer(7, Some(&p_buf), 0);
-                    enc.set_buffer(8, Some(&p_buf), 4);
-                    enc.set_buffer(9, Some(&p_buf), 8);
-                    enc.set_buffer(10, Some(&p_buf), 12);
-                    enc.set_buffer(11, Some(&p_buf), 16);
+                    enc.set_buffer(7, Some(&cp.buf), GpuConstantPool::N_HEADS as u64);
+                    enc.set_buffer(8, Some(&cp.buf), GpuConstantPool::KEY_DIM as u64);
+                    enc.set_buffer(9, Some(&cp.buf), GpuConstantPool::VALUE_DIM as u64);
+                    enc.set_buffer(10, Some(&cp.buf), GpuConstantPool::HEAD_DIM_K as u64);
+                    enc.set_buffer(11, Some(&cp.buf), GpuConstantPool::V_PER_HEAD as u64);
                     enc.dispatch_thread_groups(MTLSize::new(n_heads as u64, 1, 1), MTLSize::new(32, 1, 1));
                     enc.end_encoding();
                 }
@@ -277,21 +318,13 @@ pub fn encode_full_token_gpu(
                     enc.set_compute_pipeline_state(&gpu.rmsnorm_gated_pipeline);
                     enc.set_buffer(0, Some(&scratch.output_heads), 0);
                     enc.set_buffer(1, Some(&gw.ssm_norm_buf), 0);
-                    enc.set_buffer(2, Some(&scratch.gate_out), 0); // gate
+                    enc.set_buffer(2, Some(&scratch.gate_out), 0);
                     enc.set_buffer(3, Some(&scratch.normed), 0);
-                    let td = chunk as u32;
-                    let nd = head_dim_k.min(w.ssm_norm.len()) as u32;
-                    let nh = n_heads as u32;
-                    let has_gate = 1u32;
-                    let params: [u32; 4] = [td, nd, nh, has_gate];
-                    let eps_f32 = eps;
-                    let p_buf = gpu.device.new_buffer_with_data(params.as_ptr() as *const _, 16, MTLResourceOptions::StorageModeShared);
-                    let e_buf = gpu.device.new_buffer_with_data(&eps_f32 as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    enc.set_buffer(4, Some(&p_buf), 0);
-                    enc.set_buffer(5, Some(&p_buf), 4);
-                    enc.set_buffer(6, Some(&p_buf), 8);
-                    enc.set_buffer(7, Some(&e_buf), 0);
-                    enc.set_buffer(8, Some(&p_buf), 12);
+                    enc.set_buffer(4, Some(&cp.buf), GpuConstantPool::CHUNK as u64);
+                    enc.set_buffer(5, Some(&cp.buf), GpuConstantPool::HEAD_DIM_K as u64);
+                    enc.set_buffer(6, Some(&cp.buf), GpuConstantPool::N_HEADS as u64);
+                    enc.set_buffer(7, Some(&cp.buf), GpuConstantPool::EPS as u64);
+                    enc.set_buffer(8, Some(&cp.buf), GpuConstantPool::HAS_GATE as u64);
                     enc.dispatch_thread_groups(MTLSize::new(n_heads as u64, 1, 1), MTLSize::new(32, 1, 1));
                     enc.end_encoding();
                 }
@@ -305,9 +338,7 @@ pub fn encode_full_token_gpu(
                     enc.set_compute_pipeline_state(&gpu.residual_add_pipeline);
                     enc.set_buffer(0, Some(&scratch.hidden), 0);
                     enc.set_buffer(1, Some(&scratch.ssm_out), 0);
-                    let n = dim as u32;
-                    let n_buf = gpu.device.new_buffer_with_data(&n as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    enc.set_buffer(2, Some(&n_buf), 0);
+                    enc.set_buffer(2, Some(&cp.buf), GpuConstantPool::DIM as u64);
                     enc.dispatch_threads(MTLSize::new(dim as u64, 1, 1), MTLSize::new(256, 1, 1));
                     enc.end_encoding();
                 }
@@ -319,11 +350,8 @@ pub fn encode_full_token_gpu(
                     enc.set_buffer(0, Some(&scratch.hidden), 0);
                     enc.set_buffer(1, Some(&gw.post_attn_norm_buf), 0);
                     enc.set_buffer(2, Some(&scratch.xnorm), 0);
-                    let dim_u32 = dim as u32;
-                    let d_buf = gpu.device.new_buffer_with_data(&dim_u32 as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    let e_buf = gpu.device.new_buffer_with_data(&eps as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    enc.set_buffer(3, Some(&d_buf), 0);
-                    enc.set_buffer(4, Some(&e_buf), 0);
+                    enc.set_buffer(3, Some(&cp.buf), GpuConstantPool::DIM as u64);
+                    enc.set_buffer(4, Some(&cp.buf), GpuConstantPool::EPS as u64);
                     enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(128, 1, 1));
                     enc.end_encoding();
                 }
@@ -338,9 +366,7 @@ pub fn encode_full_token_gpu(
                     enc.set_compute_pipeline_state(&gpu.silu_pipeline);
                     enc.set_buffer(0, Some(&scratch.ffn_h1), 0);
                     enc.set_buffer(1, Some(&scratch.ssm_out), 0);
-                    let n = hidden_dim as u32;
-                    let n_buf = gpu.device.new_buffer_with_data(&n as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    enc.set_buffer(2, Some(&n_buf), 0);
+                    enc.set_buffer(2, Some(&cp.buf), GpuConstantPool::HIDDEN_DIM as u64);
                     enc.dispatch_threads(MTLSize::new(hidden_dim as u64, 1, 1), MTLSize::new(256, 1, 1));
                     enc.end_encoding();
                 }
@@ -354,9 +380,7 @@ pub fn encode_full_token_gpu(
                     enc.set_compute_pipeline_state(&gpu.residual_add_pipeline);
                     enc.set_buffer(0, Some(&scratch.hidden), 0);
                     enc.set_buffer(1, Some(&scratch.ffn_out), 0);
-                    let n = dim as u32;
-                    let n_buf = gpu.device.new_buffer_with_data(&n as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-                    enc.set_buffer(2, Some(&n_buf), 0);
+                    enc.set_buffer(2, Some(&cp.buf), GpuConstantPool::DIM as u64);
                     enc.dispatch_threads(MTLSize::new(dim as u64, 1, 1), MTLSize::new(256, 1, 1));
                     enc.end_encoding();
                 }
@@ -371,23 +395,21 @@ pub fn encode_full_token_gpu(
     }
 
     // --- Final: LM head GEMV ---
-    // RMSNorm hidden → input
+    // RMSNorm hidden → input (final_norm uploaded once as scratch buffer)
+    // TODO: pre-upload final_norm at model load to avoid per-token alloc
     {
-        let enc = cmd_buf.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&gpu.rmsnorm_simple_pipeline);
-        enc.set_buffer(0, Some(&scratch.hidden), 0);
         let final_norm = &model.final_norm;
         let fn_buf = gpu.device.new_buffer_with_data(
             final_norm.as_ptr() as *const _, (final_norm.len() * 4) as u64,
             MTLResourceOptions::StorageModeShared,
         );
+        let enc = cmd_buf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&gpu.rmsnorm_simple_pipeline);
+        enc.set_buffer(0, Some(&scratch.hidden), 0);
         enc.set_buffer(1, Some(&fn_buf), 0);
         enc.set_buffer(2, Some(&gpu.scratch_input), 0);
-        let dim_u32 = dim as u32;
-        let d_buf = gpu.device.new_buffer_with_data(&dim_u32 as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-        let e_buf = gpu.device.new_buffer_with_data(&eps as *const _ as *const _, 4, MTLResourceOptions::StorageModeShared);
-        enc.set_buffer(3, Some(&d_buf), 0);
-        enc.set_buffer(4, Some(&e_buf), 0);
+        enc.set_buffer(3, Some(&cp.buf), GpuConstantPool::DIM as u64);
+        enc.set_buffer(4, Some(&cp.buf), GpuConstantPool::EPS as u64);
         enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(128, 1, 1));
         enc.end_encoding();
     }

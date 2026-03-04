@@ -421,27 +421,25 @@ fn cmd_bench(args: &[String]) -> Result<()> {
                 gpu_upload_start.elapsed().as_secs_f64() * 1000.0
             );
 
-            // Allocate GPU-side scratch for full decode
             let gpu_scratch = ane_engine::gpu_full_decode::GpuLayerScratch::new(
-                &gpu.device,
-                c.dim,
-                c.hidden_dim,
-                c.dim * 3,
-                16, // n_heads for DeltaNet
+                &gpu.device, c.dim, c.hidden_dim, c.dim * 3, 16,
+            );
+            let gpu_cp = ane_engine::gpu_full_decode::GpuConstantPool::new(
+                &gpu.device, c.dim, c.hidden_dim, c.dim * 3, 16,
+                config.ssm_state_size, 4, // kernel_size=4 default
+                c.rms_norm_eps,
             );
 
-            // Warmup: prefill via CPU
-            // (Full attention layers not implemented on GPU yet, so we skip prefill)
             let first_token = greedy_sample(&last_logits, 0.0);
 
-            // Warmup GPU
+            // Warmup
             let _ = ane_engine::gpu_full_decode::encode_full_token_gpu(
-                &gpu, &model, &gpu_weights, &gpu_scratch, first_token,
+                &gpu, &model, &gpu_weights, &gpu_scratch, &gpu_cp, first_token,
             );
 
             let mut gen_gpu = vec![first_token];
             let mut last_logits_gpu = ane_engine::gpu_full_decode::encode_full_token_gpu(
-                &gpu, &model, &gpu_weights, &gpu_scratch, first_token,
+                &gpu, &model, &gpu_weights, &gpu_scratch, &gpu_cp, first_token,
             )?;
 
             let gpu_start = Instant::now();
@@ -452,7 +450,7 @@ fn cmd_bench(args: &[String]) -> Result<()> {
                 }
                 gen_gpu.push(next);
                 last_logits_gpu = ane_engine::gpu_full_decode::encode_full_token_gpu(
-                    &gpu, &model, &gpu_weights, &gpu_scratch, next,
+                    &gpu, &model, &gpu_weights, &gpu_scratch, &gpu_cp, next,
                 )?;
             }
             let gpu_time = gpu_start.elapsed();
