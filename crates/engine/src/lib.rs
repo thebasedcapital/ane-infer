@@ -7,6 +7,7 @@ pub mod decode;
 pub mod deltanet;
 pub mod deltanet_cache;
 pub mod gpu_decode;
+pub mod gpu_full_decode;
 pub mod kv_cache;
 pub mod metal_gemv;
 pub mod metal_graph;

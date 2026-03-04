@@ -61,8 +61,8 @@ pub struct GpuContext {
     pub gpu_memcpy_pipeline: ComputePipelineState,
     pub silu_inplace_pipeline: ComputePipelineState,
     // Scratch buffers
-    scratch_input: Buffer,
-    scratch_output: Buffer,
+    pub scratch_input: Buffer,
+    pub scratch_output: Buffer,
     scratch_input_size: usize,
     scratch_output_size: usize,
 }

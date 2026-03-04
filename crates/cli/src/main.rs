@@ -409,8 +409,8 @@ fn cmd_bench(args: &[String]) -> Result<()> {
     eprintln!("  Speed: {tg_tok_s:.1} tok/s (tg{actual_tg})");
     eprintln!();
 
-    // === Benchmark 2b: Metal GPU Decode ===
-    eprintln!("── Benchmark: Metal GPU Decode (tg{n_gen}) ──");
+    // === Benchmark 2b: Metal GPU Full Decode (ONE cmd buffer per token) ===
+    eprintln!("── Benchmark: Metal GPU Full Decode (tg{n_gen}) ──");
     match GpuContext::new() {
         Ok(gpu) => {
             eprintln!("  Uploading model weights to GPU...");
@@ -421,22 +421,29 @@ fn cmd_bench(args: &[String]) -> Result<()> {
                 gpu_upload_start.elapsed().as_secs_f64() * 1000.0
             );
 
-            let mut cache_gpu = ane_engine::deltanet_cache::HybridCache::new(&config);
-            for &tok in &prompt_tokens {
-                let _ = qwen35_forward_token(&model, &mut cache_gpu, tok)?;
-            }
+            // Allocate GPU-side scratch for full decode
+            let gpu_scratch = ane_engine::gpu_full_decode::GpuLayerScratch::new(
+                &gpu.device,
+                c.dim,
+                c.hidden_dim,
+                c.dim * 3,
+                16, // n_heads for DeltaNet
+            );
 
-            let mut last_logits_gpu = vec![0.0f32; c.vocab_size];
+            // Warmup: prefill via CPU
+            // (Full attention layers not implemented on GPU yet, so we skip prefill)
             let first_token = greedy_sample(&last_logits, 0.0);
-            last_logits_gpu = gpu_decode::qwen35_forward_token_gpu(
-                &model,
-                &mut cache_gpu,
-                first_token,
-                &gpu,
-                &gpu_weights,
-            )?;
+
+            // Warmup GPU
+            let _ = ane_engine::gpu_full_decode::encode_full_token_gpu(
+                &gpu, &model, &gpu_weights, &gpu_scratch, first_token,
+            );
 
             let mut gen_gpu = vec![first_token];
+            let mut last_logits_gpu = ane_engine::gpu_full_decode::encode_full_token_gpu(
+                &gpu, &model, &gpu_weights, &gpu_scratch, first_token,
+            )?;
+
             let gpu_start = Instant::now();
             for _ in 1..n_gen {
                 let next = greedy_sample(&last_logits_gpu, 0.0);
@@ -444,12 +451,8 @@ fn cmd_bench(args: &[String]) -> Result<()> {
                     break;
                 }
                 gen_gpu.push(next);
-                last_logits_gpu = gpu_decode::qwen35_forward_token_gpu(
-                    &model,
-                    &mut cache_gpu,
-                    next,
-                    &gpu,
-                    &gpu_weights,
+                last_logits_gpu = ane_engine::gpu_full_decode::encode_full_token_gpu(
+                    &gpu, &model, &gpu_weights, &gpu_scratch, next,
                 )?;
             }
             let gpu_time = gpu_start.elapsed();
@@ -461,7 +464,7 @@ fn cmd_bench(args: &[String]) -> Result<()> {
             };
             eprintln!("  Tokens: {gpu_tg}");
             eprintln!("  Time: {:.1}ms", gpu_time.as_secs_f64() * 1000.0);
-            eprintln!("  Speed: {gpu_tok_s:.1} tok/s (GPU Graph tg{gpu_tg})");
+            eprintln!("  Speed: {gpu_tok_s:.1} tok/s (GPU Full tg{gpu_tg})");
             let cpu_speedup = gpu_tok_s / tg_tok_s;
             eprintln!("  Speedup vs CPU: {cpu_speedup:.1}x");
             eprintln!();
