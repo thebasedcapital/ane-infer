@@ -1,0 +1,8 @@
+[package]
+name = "mil-gen"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+half.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "ane-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ane-bridge = { path = "../ane-bridge" }
+mil-gen = { path = "../mil-gen" }
+ane-gguf = { path = "../gguf" }
+half.workspace = true
+anyhow.workspace = true
+rayon = "1.10"
+metal = "0.33"
+objc = "0.2"

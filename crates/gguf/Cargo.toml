@@ -1,0 +1,10 @@
+[package]
+name = "ane-gguf"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ane-bridge = { path = "../ane-bridge" }
+half.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true

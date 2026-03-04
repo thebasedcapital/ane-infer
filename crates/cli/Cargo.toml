@@ -1,0 +1,15 @@
+[package]
+name = "ane-infer"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ane-infer"
+path = "src/main.rs"
+
+[dependencies]
+ane-bridge = { path = "../ane-bridge" }
+mil-gen = { path = "../mil-gen" }
+ane-gguf = { path = "../gguf" }
+ane-engine = { path = "../engine" }
+anyhow.workspace = true

@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ane-bridge",
+    "crates/mil-gen",
+    "crates/gguf",
+    "crates/engine",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+half = { version = "2", features = ["std"] }
+anyhow = "1"
+thiserror = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "symbols"

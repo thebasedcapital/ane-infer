@@ -1,0 +1,12 @@
+[package]
+name = "ane-bridge"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+half.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+cc = "1"
