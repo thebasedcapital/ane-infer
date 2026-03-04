@@ -32,7 +32,16 @@ mod ffi {
         ) -> *mut ANEKernel;
         pub fn ane_write_input(k: *mut ANEKernel, idx: i32, data: *const c_void, bytes: usize);
         pub fn ane_read_output(k: *mut ANEKernel, idx: i32, data: *mut c_void, bytes: usize);
+        pub fn ane_resize_io(
+            k: *mut ANEKernel,
+            n_inputs: i32,
+            input_sizes: *const usize,
+            n_outputs: i32,
+            output_sizes: *const usize,
+        );
         pub fn ane_eval(k: *mut ANEKernel) -> bool;
+        pub fn ane_eval_procedure(k: *mut ANEKernel, proc_idx: i32) -> bool;
+        pub fn ane_num_procedures(k: *mut ANEKernel) -> i32;
         pub fn ane_free(k: *mut ANEKernel);
     }
 }
@@ -153,7 +162,22 @@ impl AneKernel {
         }
     }
 
-    /// Execute the kernel on ANE hardware.
+    /// Resize IOSurfaces without recompiling the model.
+    pub fn resize_io(&mut self, input_sizes: &[usize], output_sizes: &[usize]) {
+        unsafe {
+            ffi::ane_resize_io(
+                self.raw,
+                input_sizes.len() as i32,
+                input_sizes.as_ptr(),
+                output_sizes.len() as i32,
+                output_sizes.as_ptr(),
+            );
+        }
+        self.input_bytes = input_sizes.to_vec();
+        self.output_bytes = output_sizes.to_vec();
+    }
+
+    /// Execute the kernel on ANE hardware (procedure 0 / single-procedure model).
     pub fn eval(&self) -> Result<()> {
         let ok = unsafe { ffi::ane_eval(self.raw) };
         if ok {
@@ -161,6 +185,21 @@ impl AneKernel {
         } else {
             bail!("ANE evaluation failed")
         }
+    }
+
+    /// Execute a specific procedure within a multi-procedure model.
+    pub fn eval_procedure(&self, proc_idx: usize) -> Result<()> {
+        let ok = unsafe { ffi::ane_eval_procedure(self.raw, proc_idx as i32) };
+        if ok {
+            Ok(())
+        } else {
+            bail!("ANE evaluation of procedure {proc_idx} failed")
+        }
+    }
+
+    /// Get the number of procedures in this model.
+    pub fn num_procedures(&self) -> usize {
+        unsafe { ffi::ane_num_procedures(self.raw) as usize }
     }
 }
 

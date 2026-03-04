@@ -202,6 +202,44 @@ fn cmd_bench_ane() -> Result<()> {
     );
     eprintln!("  Throughput: {tflops:.2} TFLOPS (FP16)");
 
+    // Multi-procedure test: 2 procedures in one model
+    eprintln!("\nTesting multi-procedure model (2 procedures)...");
+    let procs = vec![
+        ("proc0".into(), dim, dim, spatial, 64u64),
+        ("proc1".into(), dim, dim, spatial, 64u64), // same weights, different procedure
+    ];
+    let multi_mil = mil_gen::mil_gen_multi_procedure(&procs);
+    let multi_kernel = ane_bridge::AneKernel::compile(&multi_mil, Some(&blob), &[in_bytes], &[out_bytes])
+        .context("Multi-procedure compilation failed")?;
+
+    let n_procs = multi_kernel.num_procedures();
+    eprintln!("  Procedures detected: {n_procs}");
+
+    multi_kernel.write_input_f32(0, &input);
+
+    // Test each procedure
+    for p in 0..n_procs.min(2) {
+        multi_kernel.eval_procedure(p)?;
+        let mut out = vec![0f32; dim * spatial];
+        multi_kernel.read_output_f32(0, &mut out);
+        let max_val = out.iter().cloned().fold(0f32, f32::max);
+        eprintln!("  Procedure {p}: ok (max output={max_val:.4})");
+    }
+
+    // Benchmark sequential dispatch of both procedures
+    for _ in 0..5 {
+        multi_kernel.eval_procedure(0)?;
+        multi_kernel.eval_procedure(1)?;
+    }
+    let start2 = Instant::now();
+    for _ in 0..n_iters {
+        multi_kernel.eval_procedure(0)?;
+        multi_kernel.eval_procedure(1)?;
+    }
+    let elapsed2 = start2.elapsed();
+    let ms_per_pair = elapsed2.as_secs_f64() * 1000.0 / n_iters as f64;
+    eprintln!("  2-proc sequential: {ms_per_pair:.3}ms/pair ({:.3}ms/proc)", ms_per_pair / 2.0);
+
     Ok(())
 }
 

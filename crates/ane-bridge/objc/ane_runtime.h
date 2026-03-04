@@ -42,6 +42,19 @@ void ane_read_output(ANEKernel *k, int idx, void *data, size_t bytes);
 // Returns true on success.
 bool ane_eval(ANEKernel *k);
 
+// Execute a specific procedure within a multi-procedure model.
+// proc_idx: 0-based procedure index
+// Returns true on success.
+bool ane_eval_procedure(ANEKernel *k, int proc_idx);
+
+// Get the number of procedures in a compiled model.
+int ane_num_procedures(ANEKernel *k);
+
+// Resize input/output IOSurfaces without recompiling.
+// Useful for multi-procedure models where different procedures need different sizes.
+void ane_resize_io(ANEKernel *k, int n_inputs, const size_t *input_sizes,
+                   int n_outputs, const size_t *output_sizes);
+
 // Free all resources associated with a kernel.
 void ane_free(ANEKernel *k);
 
