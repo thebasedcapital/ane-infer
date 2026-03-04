@@ -1535,7 +1535,7 @@ fn greedy_sample(logits: &[f32], temperature: f32) -> u32 {
         logits
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, _)| i as u32)
             .unwrap_or(0)
     } else {
@@ -1544,7 +1544,7 @@ fn greedy_sample(logits: &[f32], temperature: f32) -> u32 {
         scaled
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, _)| i as u32)
             .unwrap_or(0)
     }
