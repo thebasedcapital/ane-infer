@@ -95,6 +95,57 @@ pub fn mil_gen_fused_ffn(dim: usize, hidden_dim: usize, spatial: usize) -> Strin
     s
 }
 
+/// Generate fused dual-projection: two convs from same input, two outputs.
+/// Used for DeltaNet gate + ssm_out (both dim→dim from same input).
+pub fn mil_gen_fused_dual_proj(in_dim: usize, out_a: usize, out_b: usize, spatial: usize) -> String {
+    let cs_a = 64 + out_a * in_dim * 2;
+    let a_offset = 64u64;
+    let b_offset = 64 + cs_a as u64;
+
+    let mut s = String::with_capacity(4096);
+    s.push_str(MIL_HEADER);
+    s.push_str(&format!("    func main<ios18>(tensor<fp32, [1, {in_dim}, 1, {spatial}]> x) {{\n"));
+    s.push_str(CONV_PREAMBLE);
+    s.push_str(&format!("        tensor<fp16, [1, {in_dim}, 1, {spatial}]> x16 = cast(dtype = to_fp16, x = x)[name = string(\"cast_in\")];\n"));
+    s.push_str(&format!("        tensor<fp16, [{out_a}, {in_dim}, 1, 1]> Wa = const()[name = string(\"Wa\"), val = tensor<fp16, [{out_a}, {in_dim}, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64({a_offset})))];\n"));
+    s.push_str(&format!("        tensor<fp16, [1, {out_a}, 1, {spatial}]> ha = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = Wa, x = x16)[name = string(\"conv_a\")];\n"));
+    s.push_str(&format!("        tensor<fp16, [{out_b}, {in_dim}, 1, 1]> Wb = const()[name = string(\"Wb\"), val = tensor<fp16, [{out_b}, {in_dim}, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64({b_offset})))];\n"));
+    s.push_str(&format!("        tensor<fp16, [1, {out_b}, 1, {spatial}]> hb = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = Wb, x = x16)[name = string(\"conv_b\")];\n"));
+    s.push_str(&format!("        tensor<fp32, [1, {out_a}, 1, {spatial}]> a = cast(dtype = to_fp32, x = ha)[name = string(\"cast_a\")];\n"));
+    s.push_str(&format!("        tensor<fp32, [1, {out_b}, 1, {spatial}]> b = cast(dtype = to_fp32, x = hb)[name = string(\"cast_b\")];\n"));
+    s.push_str("    } -> (a, b);\n");
+    s.push_str(MIL_FOOTER);
+    s
+}
+
+/// Generate fused triple-projection: three convs from same input.
+/// Used for FullAttn WQ+WK+WV (potentially different output dims).
+pub fn mil_gen_fused_triple_proj(in_dim: usize, out_a: usize, out_b: usize, out_c: usize, spatial: usize) -> String {
+    let cs_a = 64 + out_a * in_dim * 2;
+    let cs_b = 64 + out_b * in_dim * 2;
+    let a_offset = 64u64;
+    let b_offset = 64 + cs_a as u64;
+    let c_offset = 64 + cs_a as u64 + cs_b as u64;
+
+    let mut s = String::with_capacity(4096);
+    s.push_str(MIL_HEADER);
+    s.push_str(&format!("    func main<ios18>(tensor<fp32, [1, {in_dim}, 1, {spatial}]> x) {{\n"));
+    s.push_str(CONV_PREAMBLE);
+    s.push_str(&format!("        tensor<fp16, [1, {in_dim}, 1, {spatial}]> x16 = cast(dtype = to_fp16, x = x)[name = string(\"cast_in\")];\n"));
+    s.push_str(&format!("        tensor<fp16, [{out_a}, {in_dim}, 1, 1]> Wa = const()[name = string(\"Wa\"), val = tensor<fp16, [{out_a}, {in_dim}, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64({a_offset})))];\n"));
+    s.push_str(&format!("        tensor<fp16, [1, {out_a}, 1, {spatial}]> ha = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = Wa, x = x16)[name = string(\"conv_a\")];\n"));
+    s.push_str(&format!("        tensor<fp16, [{out_b}, {in_dim}, 1, 1]> Wb = const()[name = string(\"Wb\"), val = tensor<fp16, [{out_b}, {in_dim}, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64({b_offset})))];\n"));
+    s.push_str(&format!("        tensor<fp16, [1, {out_b}, 1, {spatial}]> hb = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = Wb, x = x16)[name = string(\"conv_b\")];\n"));
+    s.push_str(&format!("        tensor<fp16, [{out_c}, {in_dim}, 1, 1]> Wc = const()[name = string(\"Wc\"), val = tensor<fp16, [{out_c}, {in_dim}, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64({c_offset})))];\n"));
+    s.push_str(&format!("        tensor<fp16, [1, {out_c}, 1, {spatial}]> hc = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = Wc, x = x16)[name = string(\"conv_c\")];\n"));
+    s.push_str(&format!("        tensor<fp32, [1, {out_a}, 1, {spatial}]> a = cast(dtype = to_fp32, x = ha)[name = string(\"cast_a\")];\n"));
+    s.push_str(&format!("        tensor<fp32, [1, {out_b}, 1, {spatial}]> b = cast(dtype = to_fp32, x = hb)[name = string(\"cast_b\")];\n"));
+    s.push_str(&format!("        tensor<fp32, [1, {out_c}, 1, {spatial}]> c = cast(dtype = to_fp32, x = hc)[name = string(\"cast_c\")];\n"));
+    s.push_str("    } -> (a, b, c);\n");
+    s.push_str(MIL_FOOTER);
+    s
+}
+
 /// Generate fused gate+SiLU+up+mul kernel (without down_proj to stay under 32MB SRAM).
 /// This chains 5 ops: 2 convs + sigmoid + 2 muls.
 ///

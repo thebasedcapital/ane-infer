@@ -76,6 +76,100 @@ impl AneProjection {
     }
 }
 
+/// Compiled ANE kernel for dual projection (2 outputs from same input).
+pub struct AneDualProjection {
+    kernel: AneKernel,
+    in_dim: usize,
+    out_a: usize,
+    out_b: usize,
+    seq_len: usize,
+}
+
+impl AneDualProjection {
+    pub fn compile(wa_f32: &[f32], wb_f32: &[f32], in_dim: usize, out_a: usize, out_b: usize, seq_len: usize) -> Result<Self> {
+        let mil = mil_gen::mega::mil_gen_fused_dual_proj(in_dim, out_a, out_b, seq_len);
+        let blob = build_weight_blob(&[wa_f32, wb_f32]);
+        let in_bytes = in_dim * seq_len * 4;
+        let out_a_bytes = out_a * seq_len * 4;
+        let out_b_bytes = out_b * seq_len * 4;
+        let kernel = AneKernel::compile(&mil, Some(&blob), &[in_bytes], &[out_a_bytes, out_b_bytes])?;
+        Ok(Self { kernel, in_dim, out_a, out_b, seq_len })
+    }
+
+    pub fn forward(&self, input: &[f32], out_a: &mut [f32], out_b: &mut [f32]) -> Result<()> {
+        let mut input_t = vec![0.0f32; self.in_dim * self.seq_len];
+        for t in 0..self.seq_len {
+            for d in 0..self.in_dim {
+                input_t[d * self.seq_len + t] = input[t * self.in_dim + d];
+            }
+        }
+        self.kernel.write_input_f32(0, &input_t);
+        self.kernel.eval()?;
+
+        let mut oa_t = vec![0.0f32; self.out_a * self.seq_len];
+        self.kernel.read_output_f32(0, &mut oa_t);
+        for t in 0..self.seq_len {
+            for d in 0..self.out_a {
+                out_a[t * self.out_a + d] = oa_t[d * self.seq_len + t];
+            }
+        }
+
+        let mut ob_t = vec![0.0f32; self.out_b * self.seq_len];
+        self.kernel.read_output_f32(1, &mut ob_t);
+        for t in 0..self.seq_len {
+            for d in 0..self.out_b {
+                out_b[t * self.out_b + d] = ob_t[d * self.seq_len + t];
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Compiled ANE kernel for triple projection (3 outputs from same input).
+pub struct AneTripleProjection {
+    kernel: AneKernel,
+    in_dim: usize,
+    out_a: usize,
+    out_b: usize,
+    out_c: usize,
+    seq_len: usize,
+}
+
+impl AneTripleProjection {
+    pub fn compile(wa: &[f32], wb: &[f32], wc: &[f32], in_dim: usize, out_a: usize, out_b: usize, out_c: usize, seq_len: usize) -> Result<Self> {
+        let mil = mil_gen::mega::mil_gen_fused_triple_proj(in_dim, out_a, out_b, out_c, seq_len);
+        let blob = build_weight_blob(&[wa, wb, wc]);
+        let in_bytes = in_dim * seq_len * 4;
+        let oa = out_a * seq_len * 4;
+        let ob = out_b * seq_len * 4;
+        let oc = out_c * seq_len * 4;
+        let kernel = AneKernel::compile(&mil, Some(&blob), &[in_bytes], &[oa, ob, oc])?;
+        Ok(Self { kernel, in_dim, out_a, out_b, out_c, seq_len })
+    }
+
+    pub fn forward(&self, input: &[f32], out_a: &mut [f32], out_b: &mut [f32], out_c: &mut [f32]) -> Result<()> {
+        let mut input_t = vec![0.0f32; self.in_dim * self.seq_len];
+        for t in 0..self.seq_len {
+            for d in 0..self.in_dim {
+                input_t[d * self.seq_len + t] = input[t * self.in_dim + d];
+            }
+        }
+        self.kernel.write_input_f32(0, &input_t);
+        self.kernel.eval()?;
+
+        for (idx, (out, out_dim)) in [(out_a, self.out_a), (out_b, self.out_b), (out_c, self.out_c)].into_iter().enumerate() {
+            let mut ot = vec![0.0f32; out_dim * self.seq_len];
+            self.kernel.read_output_f32(idx, &mut ot);
+            for t in 0..self.seq_len {
+                for d in 0..out_dim {
+                    out[t * out_dim + d] = ot[d * self.seq_len + t];
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Dequantize a Q8Tensor to FP32 for ANE weight blob construction.
 fn dequant_q8_to_f32(q8: &Q8Tensor) -> Vec<f32> {
     let bpr = q8.n / 32;
@@ -156,21 +250,19 @@ impl FusedFfnKernel {
 }
 
 /// Compiled ANE projections for one DeltaNet layer.
-/// Uses mega-kernels where possible.
+/// Dispatch count: qkv(1) + gate(1) + ffn(1) = 3 dispatches (ssm_out is per-token on CPU).
 pub struct DeltaNetAneKernels {
-    pub qkv: AneProjection,        // [dim → 3*dim] (TODO: fuse into mega)
-    pub gate: AneProjection,       // [dim → dim]
-    pub ssm_out: AneProjection,    // [dim → dim]
-    pub fused_ffn: FusedFfnKernel, // gate+SiLU+up+mul+down = 6 ops, ONE dispatch
+    pub qkv: AneProjection,        // [dim → 3*dim] — single kernel
+    pub gate: AneProjection,       // [dim → dim] — batched gate projection
+    pub fused_ffn: FusedFfnKernel, // gate+SiLU+up+mul+down = 8 ops, ONE dispatch
 }
 
 /// Compiled ANE projections for one full attention layer.
+/// Dispatch count: qkv(1) + wo(1) + ffn(1) = 3 dispatches per layer.
 pub struct FullAttnAneKernels {
-    pub wq: AneProjection,         // [dim → q_dim]
-    pub wk: AneProjection,         // [dim → kv_dim]
-    pub wv: AneProjection,         // [dim → kv_dim]
-    pub wo: AneProjection,         // [q_only_dim → dim]
-    pub fused_ffn: FusedFfnKernel, // gate+SiLU+up+mul+down = 6 ops, ONE dispatch
+    pub fused_qkv: AneTripleProjection, // [dim → q, k, v] — fused QKV
+    pub wo: AneProjection,              // [q_only_dim → dim]
+    pub fused_ffn: FusedFfnKernel,      // gate+SiLU+up+mul+down = 8 ops, ONE dispatch
 }
 
 /// All ANE kernels for prefill.
@@ -197,7 +289,6 @@ pub fn compile_ane_prefill(
             HybridLayerWeights::DeltaNet(lw) => {
                 let qkv_f32 = dequant_q8_to_f32(&lw.qkv);
                 let gate_f32 = dequant_q8_to_f32(&lw.attn_gate);
-                let ssm_out_f32 = dequant_q8_to_f32(&lw.ssm_out);
                 let fg_f32 = dequant_q8_to_f32(&lw.ffn.gate);
                 let fu_f32 = dequant_q8_to_f32(&lw.ffn.up);
                 let fd_f32 = dequant_q8_to_f32(&lw.ffn.down);
@@ -208,10 +299,9 @@ pub fn compile_ane_prefill(
                 kernels.push(LayerAneKernels::DeltaNet(DeltaNetAneKernels {
                     qkv: AneProjection::compile(&qkv_f32, dim, dim * 3, seq_len)?,
                     gate: AneProjection::compile(&gate_f32, dim, dim, seq_len)?,
-                    ssm_out: AneProjection::compile(&ssm_out_f32, dim, dim, seq_len)?,
                     fused_ffn,
                 }));
-                eprintln!(" ok (3+1 mega)");
+                eprintln!(" ok (3 dispatches: qkv + gate + ffn)");
             }
             HybridLayerWeights::FullAttention(lw) => {
                 let wq_f32 = dequant_q8_to_f32(&lw.wq);
@@ -228,15 +318,15 @@ pub fn compile_ane_prefill(
 
                 let fused_ffn =
                     FusedFfnKernel::compile(&fg_f32, &fu_f32, &fd_f32, dim, hidden_dim, seq_len)?;
+                let fused_qkv =
+                    AneTripleProjection::compile(&wq_f32, &wk_f32, &wv_f32, dim, q_dim, kv_dim, kv_dim, seq_len)?;
 
                 kernels.push(LayerAneKernels::FullAttention(FullAttnAneKernels {
-                    wq: AneProjection::compile(&wq_f32, dim, q_dim, seq_len)?,
-                    wk: AneProjection::compile(&wk_f32, dim, kv_dim, seq_len)?,
-                    wv: AneProjection::compile(&wv_f32, dim, kv_dim, seq_len)?,
+                    fused_qkv,
                     wo: AneProjection::compile(&wo_f32, q_only_dim, dim, seq_len)?,
                     fused_ffn,
                 }));
-                eprintln!(" ok (4+1 mega)");
+                eprintln!(" ok (3 dispatches: qkv + wo + ffn)");
             }
         }
     }
