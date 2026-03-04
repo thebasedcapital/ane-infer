@@ -77,6 +77,39 @@ pub fn encode_full_token_gpu(
     let head_dim_k = chunk / n_heads;
     let eps = cfg.base.rms_norm_eps;
 
+    // Pre-allocate a params pool — one big buffer for ALL small constants
+    // Each layer needs ~20 params × 4 bytes = 80 bytes, × 24 layers = 1920 bytes
+    // Plus global params. 4KB is plenty.
+    let params_pool = gpu.device.new_buffer(4096, MTLResourceOptions::StorageModeShared);
+    let pp = params_pool.contents() as *mut u32;
+
+    // Write commonly-used constants at known offsets
+    // Offset 0: dim (u32)
+    // Offset 4: inner_size (u32)
+    // Offset 8: hidden_dim (u32)
+    // Offset 12: n_heads (u32)
+    // Offset 16: head_dim_k (u32)
+    // Offset 20: chunk (u32)
+    // Offset 24: eps (f32)
+    // Offset 28: key_dim (u32)
+    // Offset 32: value_dim (u32)
+    // Offset 36: v_per_head (u32)
+    // Offset 40: kernel_size (u32)
+    // Offset 44...: per-GEMV params (n_blocks, m) pairs
+    unsafe {
+        *pp.add(0) = dim as u32;
+        *pp.add(1) = inner_size as u32;
+        *pp.add(2) = hidden_dim as u32;
+        *pp.add(3) = n_heads as u32;
+        *pp.add(4) = head_dim_k as u32;
+        *pp.add(5) = chunk as u32;
+        *(pp.add(6) as *mut f32) = eps;
+        *pp.add(7) = cfg.ssm_state_size as u32; // key_dim
+        *pp.add(8) = cfg.ssm_state_size as u32; // value_dim
+        *pp.add(9) = (chunk / n_heads) as u32;  // v_per_head
+        // kernel_size written per-layer below
+    }
+
     // Write embedding to hidden buffer
     unsafe {
         let emb = model.embedding.as_ptr().add((token_id as usize) * dim);
@@ -114,13 +147,13 @@ pub fn encode_full_token_gpu(
 
                 // --- GEMV: QKV + gate + beta + alpha (5 GEMVs) ---
                 // QKV: [dim] → [inner_size]
-                encode_gemv(cmd_buf, gpu, &gw.qkv, &gpu.scratch_input, 0, &scratch.qkv_out, 0, dim, inner_size);
+                encode_gemv_prealloc(cmd_buf, gpu, &gw.qkv, &gpu.scratch_input, 0, &scratch.qkv_out, 0, &gw.qkv_params);
                 // Gate: [dim] → [dim]
-                encode_gemv(cmd_buf, gpu, &gw.attn_gate, &gpu.scratch_input, 0, &scratch.gate_out, 0, dim, dim);
+                encode_gemv_prealloc(cmd_buf, gpu, &gw.attn_gate, &gpu.scratch_input, 0, &scratch.gate_out, 0, &gw.attn_gate_params);
                 // Beta: [dim] → [n_heads]
-                encode_gemv(cmd_buf, gpu, &gw.ssm_beta, &gpu.scratch_input, 0, &scratch.beta_raw, 0, dim, n_heads);
+                encode_gemv_prealloc(cmd_buf, gpu, &gw.ssm_beta, &gpu.scratch_input, 0, &scratch.beta_raw, 0, &gw.ssm_beta_params);
                 // Alpha: [dim] → [n_heads]
-                encode_gemv(cmd_buf, gpu, &gw.ssm_alpha, &gpu.scratch_input, 0, &scratch.alpha_raw, 0, dim, n_heads);
+                encode_gemv_prealloc(cmd_buf, gpu, &gw.ssm_alpha, &gpu.scratch_input, 0, &scratch.alpha_raw, 0, &gw.ssm_alpha_params);
 
                 // --- Conv1d + SiLU ---
                 {
@@ -264,7 +297,7 @@ pub fn encode_full_token_gpu(
                 }
 
                 // --- GEMV: SSM out [chunk→dim] ---
-                encode_gemv(cmd_buf, gpu, &gw.ssm_out, &scratch.normed, 0, &scratch.ssm_out, 0, chunk.min(dim), dim);
+                encode_gemv_prealloc(cmd_buf, gpu, &gw.ssm_out, &scratch.normed, 0, &scratch.ssm_out, 0, &gw.ssm_out_params);
 
                 // --- Residual: hidden += ssm_out ---
                 {
@@ -296,9 +329,8 @@ pub fn encode_full_token_gpu(
                 }
 
                 // --- FFN: gate + up GEMVs ---
-                encode_gemv(cmd_buf, gpu, &gw.ffn_gate, &scratch.xnorm, 0, &scratch.ffn_h1, 0, dim, hidden_dim);
-                // Reuse ssm_out buffer for FFN up (it's done being read)
-                encode_gemv(cmd_buf, gpu, &gw.ffn_up, &scratch.xnorm, 0, &scratch.ssm_out, 0, dim, hidden_dim);
+                encode_gemv_prealloc(cmd_buf, gpu, &gw.ffn_gate, &scratch.xnorm, 0, &scratch.ffn_h1, 0, &gw.ffn_gate_params);
+                encode_gemv_prealloc(cmd_buf, gpu, &gw.ffn_up, &scratch.xnorm, 0, &scratch.ssm_out, 0, &gw.ffn_up_params);
 
                 // --- SiLU(gate) * up ---
                 {
@@ -314,7 +346,7 @@ pub fn encode_full_token_gpu(
                 }
 
                 // --- FFN down GEMV ---
-                encode_gemv(cmd_buf, gpu, &gw.ffn_down, &scratch.ffn_h1, 0, &scratch.ffn_out, 0, hidden_dim, dim);
+                encode_gemv_prealloc(cmd_buf, gpu, &gw.ffn_down, &scratch.ffn_h1, 0, &scratch.ffn_out, 0, &gw.ffn_down_params);
 
                 // --- Residual: hidden += ffn_out ---
                 {
@@ -361,7 +393,7 @@ pub fn encode_full_token_gpu(
     }
 
     // LM head GEMV
-    encode_gemv(cmd_buf, gpu, &gpu_weights.lm_head, &gpu.scratch_input, 0, &gpu.scratch_output, 0, dim, cfg.base.vocab_size);
+    encode_gemv_prealloc(cmd_buf, gpu, &gpu_weights.lm_head, &gpu.scratch_input, 0, &gpu.scratch_output, 0, &gpu_weights.lm_head_params);
 
     // ONE commit, ONE wait for ENTIRE token
     cmd_buf.commit();
@@ -378,7 +410,8 @@ pub fn encode_full_token_gpu(
 }
 
 // Helper: encode a Q8 GEMV into an existing command buffer
-fn encode_gemv(
+// params_buf: pre-allocated [n_blocks, m] buffer (from GpuDeltaNetLayerWeights)
+fn encode_gemv_prealloc(
     cmd_buf: &CommandBufferRef,
     gpu: &GpuContext,
     weight: &GpuBuffer,
@@ -386,23 +419,16 @@ fn encode_gemv(
     input_offset: usize,
     output_buf: &Buffer,
     output_offset: usize,
-    _input_len: usize,
-    output_len: usize,
+    params_buf: &Buffer, // pre-allocated at model load, contains [n_blocks, m]
 ) {
     let m = weight.m as u32;
-    let n_blocks = weight.n_blocks;
-    let params: [u32; 2] = [n_blocks, m];
-    let p_buf = gpu.device.new_buffer_with_data(
-        params.as_ptr() as *const _, 8, MTLResourceOptions::StorageModeShared,
-    );
-
     let enc = cmd_buf.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&gpu.gemv_pipeline);
     enc.set_buffer(0, Some(&weight.buffer), 0);
     enc.set_buffer(1, Some(input_buf), (input_offset * 4) as u64);
     enc.set_buffer(2, Some(output_buf), (output_offset * 4) as u64);
-    enc.set_buffer(3, Some(&p_buf), 0);
-    enc.set_buffer(4, Some(&p_buf), 4);
+    enc.set_buffer(3, Some(params_buf), 0);
+    enc.set_buffer(4, Some(params_buf), 4);
     enc.dispatch_thread_groups(MTLSize::new(m as u64, 1, 1), MTLSize::new(128, 1, 1));
     enc.end_encoding();
 }
