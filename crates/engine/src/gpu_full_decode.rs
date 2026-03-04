@@ -451,6 +451,7 @@ fn encode_gemv_prealloc(
     enc.set_buffer(2, Some(output_buf), (output_offset * 4) as u64);
     enc.set_buffer(3, Some(params_buf), 0);
     enc.set_buffer(4, Some(params_buf), 4);
-    enc.dispatch_thread_groups(MTLSize::new(m as u64, 1, 1), MTLSize::new(128, 1, 1));
+    // NR0=2: each threadgroup handles 2 output rows, so dispatch half as many
+    enc.dispatch_thread_groups(MTLSize::new(((m as u64) + 1) / 2, 1, 1), MTLSize::new(128, 1, 1));
     enc.end_encoding();
 }

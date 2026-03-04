@@ -313,8 +313,8 @@ impl<'a> GpuGraph<'a> {
                     encoder.set_buffer(3, Some(&n_blocks_buf), 0);
                     encoder.set_buffer(4, Some(&m_buf), 0);
 
-                    // New shader: one threadgroup per row, 128 threads per threadgroup
-                    let tg_count = MTLSize::new(m as u64, 1, 1);
+                    // NR0=2: each threadgroup handles 2 rows
+                    let tg_count = MTLSize::new(((m as u64) + 1) / 2, 1, 1);
                     let tg_size = MTLSize::new(128, 1, 1);
                     encoder.dispatch_thread_groups(tg_count, tg_size);
                     encoder.end_encoding();
@@ -414,7 +414,7 @@ impl<'a> GpuGraph<'a> {
                     encoder.set_buffer(3, Some(&params), po as u64);      // n_blocks
                     encoder.set_buffer(4, Some(&params), (po + 4) as u64); // m
 
-                    let tg_count = MTLSize::new(m as u64, 1, 1);
+                    let tg_count = MTLSize::new(((m as u64) + 1) / 2, 1, 1);
                     let tg_size = MTLSize::new(128, 1, 1);
                     encoder.dispatch_thread_groups(tg_count, tg_size);
                     encoder.end_encoding();

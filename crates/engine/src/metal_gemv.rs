@@ -142,7 +142,7 @@ impl MetalContext {
             1,
             1,
         );
-        let tg_count = MTLSize::new(m as u64, 1, 1);
+        let tg_count = MTLSize::new(((m as u64) + 1) / 2, 1, 1); // NR0=2
         let tg_size = MTLSize::new(128, 1, 1);
         encoder.dispatch_thread_groups(tg_count, tg_size);
         encoder.end_encoding();
@@ -284,7 +284,7 @@ impl MetalContext {
             1,
             1,
         );
-        let tg_count = MTLSize::new(m as u64, 1, 1);
+        let tg_count = MTLSize::new(((m as u64) + 1) / 2, 1, 1); // NR0=2
         let tg_size = MTLSize::new(128, 1, 1);
         encoder.dispatch_thread_groups(tg_count, tg_size);
         encoder.end_encoding();
