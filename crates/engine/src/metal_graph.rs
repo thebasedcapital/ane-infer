@@ -183,13 +183,16 @@ impl GpuContext {
 pub struct GpuGraph<'a> {
     ctx: &'a GpuContext,
     ops: Vec<GraphOp>,
+    params_buf: Buffer, // persistent params buffer (256 bytes, reused across executes)
 }
 
 impl<'a> GpuGraph<'a> {
     pub fn new(ctx: &'a GpuContext) -> Self {
+        let params_buf = ctx.device.new_buffer(256, MTLResourceOptions::StorageModeShared);
         Self {
             ctx,
             ops: Vec::new(),
+            params_buf,
         }
     }
 
@@ -316,31 +319,46 @@ impl<'a> GpuGraph<'a> {
         Ok(())
     }
 
-    /// Execute with per-op params buffers.
-    /// CRITICAL FIX: Previously shared one params_buf across all ops,
-    /// causing later ops to overwrite earlier ops' params before GPU reads them.
-    /// Now each op gets its own inline params via setBytes or separate buffer.
+    /// Execute with pre-allocated per-op params in one large buffer.
+    /// Each op writes its params at a unique offset, avoiding overwrites.
     pub fn execute_with_params(&self, _params_buf: &Buffer) -> Result<()> {
         if self.ops.is_empty() {
             return Ok(());
         }
 
+        // Use a persistent params buffer (256 bytes, allocated once with GpuGraph)
+        let params = &self.params_buf;
+
+        // Write all params upfront into persistent buffer
+        let params_ptr = params.contents() as *mut u32;
+        let mut param_offset = 0usize;
+        let mut param_offsets = Vec::with_capacity(self.ops.len());
+        for graph_op in &self.ops {
+            param_offsets.push(param_offset);
+            match graph_op {
+                GraphOp::Gemv(op) => {
+                    unsafe {
+                        *params_ptr.add(param_offset / 4) = op.weight_buffer.n_blocks;
+                        *params_ptr.add(param_offset / 4 + 1) = op.weight_buffer.m as u32;
+                    }
+                    param_offset += 8;
+                }
+                GraphOp::SiluMul(op) => {
+                    unsafe {
+                        *params_ptr.add(param_offset / 4) = op.n as u32;
+                    }
+                    param_offset += 4;
+                }
+            }
+        }
+
         let cmd_buf = self.ctx.queue.new_command_buffer();
 
-        for graph_op in &self.ops {
+        for (i, graph_op) in self.ops.iter().enumerate() {
+            let po = param_offsets[i];
             match graph_op {
                 GraphOp::Gemv(op) => {
                     let m = op.weight_buffer.m as u32;
-                    let n_blocks = op.weight_buffer.n_blocks;
-
-                    // Each op gets its own params buffer — critical for correctness
-                    // when multiple GEMVs with different m/n_blocks are in one command buffer
-                    let op_params = self.ctx.device.new_buffer_with_data(
-                        [n_blocks, m].as_ptr() as *const _,
-                        8,
-                        MTLResourceOptions::StorageModeShared,
-                    );
-
                     let encoder = cmd_buf.new_compute_command_encoder();
 
                     encoder.set_compute_pipeline_state(&self.ctx.gemv_pipeline);
@@ -355,8 +373,8 @@ impl<'a> GpuGraph<'a> {
                         Some(&self.ctx.scratch_output),
                         (op.output_offset * 4) as u64,
                     );
-                    encoder.set_buffer(3, Some(&op_params), 0);
-                    encoder.set_buffer(4, Some(&op_params), 4);
+                    encoder.set_buffer(3, Some(&params), po as u64);      // n_blocks
+                    encoder.set_buffer(4, Some(&params), (po + 4) as u64); // m
 
                     let tg_count = MTLSize::new(m as u64, 1, 1);
                     let tg_size = MTLSize::new(128, 1, 1);
@@ -365,12 +383,6 @@ impl<'a> GpuGraph<'a> {
                 }
                 GraphOp::SiluMul(op) => {
                     let n = op.n as u32;
-                    let n_buf = self.ctx.device.new_buffer_with_data(
-                        &n as *const u32 as *const _,
-                        4,
-                        MTLResourceOptions::StorageModeShared,
-                    );
-
                     let encoder = cmd_buf.new_compute_command_encoder();
                     encoder.set_compute_pipeline_state(&self.ctx.silu_pipeline);
                     encoder.set_buffer(
@@ -383,7 +395,7 @@ impl<'a> GpuGraph<'a> {
                         Some(&self.ctx.scratch_output),
                         (op.up_offset * 4) as u64,
                     );
-                    encoder.set_buffer(2, Some(&n_buf), 0);
+                    encoder.set_buffer(2, Some(&params), po as u64);
                     let threads = MTLSize::new(n as u64, 1, 1);
                     let tg_size = MTLSize::new(
                         self.ctx.silu_pipeline.thread_execution_width().min(n as u64),
