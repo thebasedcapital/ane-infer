@@ -12,9 +12,14 @@ struct block_q4_0 {
 #define NR0 2
 #define NQ 8
 
-inline float q4_unpack(uint8_t byte, int offset) {
-    int nibble = (byte >> (offset * 4)) & 0x0F;
-    return float(nibble - 8);
+// GGUF Q4_0: elements 0-15 = low nibbles of bytes 0-15
+//            elements 16-31 = high nibbles of bytes 0-15
+inline float q4_decode(device const uint8_t* qs, int elem) {
+    int byte_idx = elem & 15;         // byte 0-15
+    int is_high = (elem >> 4) & 1;    // 0 for elem 0-15, 1 for elem 16-31
+    uint8_t byte = qs[byte_idx];
+    int nibble = is_high ? (byte >> 4) : (byte & 0x0F);
+    return float(nibble) - 8.0f;
 }
 
 kernel void q4_gemv(
@@ -63,10 +68,7 @@ kernel void q4_gemv(
             float sumq = 0.0f;
             for (short i = 0; i < NQ; ++i) {
                 const int elem_in_block = il * NQ + i;
-                const int byte_off = elem_in_block / 2;
-                const int nibble_off = elem_in_block % 2;
-                const uint8_t packed = w_rows[row][ib].qs[byte_off];
-                const float qv = q4_unpack(packed, nibble_off);
+                const float qv = q4_decode(w_rows[row][ib].qs, elem_in_block);
                 sumq += qv * yl[i];
             }
             sumf[row] += sumq * d;

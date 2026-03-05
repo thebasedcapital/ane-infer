@@ -189,13 +189,16 @@ fn dequant_q8_to_f32(q8: &Q8Tensor) -> Vec<f32> {
             }
         }
         QuantType::Q4_0 => {
+            // GGUF Q4_0: elements 0-15 = low nibbles of bytes 0-15
+            //            elements 16-31 = high nibbles of bytes 0-15
             for row in 0..q8.m {
                 for b in 0..bpr {
-                    let off = (row * bpr + b) * 18; // Q4_0: 2 bytes scale + 16 bytes packed nibbles
+                    let off = (row * bpr + b) * 18;
                     let scale = f16::from_le_bytes([q8.data[off], q8.data[off + 1]]).to_f32();
                     for i in 0..32 {
-                        let byte = q8.data[off + 2 + i / 2];
-                        let nibble = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                        let byte_idx = i & 15;
+                        let byte = q8.data[off + 2 + byte_idx];
+                        let nibble = if i < 16 { byte & 0x0F } else { byte >> 4 };
                         out[row * q8.n + b * 32 + i] = (nibble as i32 - 8) as f32 * scale;
                     }
                 }
