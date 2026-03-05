@@ -52,43 +52,41 @@ kernel void sdpa_causal(
     const uint q_off = q_head * head_dim;
     const uint kv_off = kv_head * head_dim;
 
+    // Online softmax: single pass with running max and correction
     float max_score = -INFINITY;
-    for (uint s = tiisg; s < seq_len; s += 32) {
-        float score = 0.0f;
-        for (uint d = 0; d < head_dim; d++) {
-            score += q[q_off + d] * k_cache[s * n_kv_heads * head_dim + kv_off + d];
-        }
-        score *= scale;
-        max_score = max(max_score, score);
-    }
-    max_score = simd_max(max_score);
-
     float exp_sum = 0.0f;
-    for (uint s = tiisg; s < seq_len; s += 32) {
+    float out_local = 0.0f;  // Each thread accumulates one output dimension
+
+    // Each thread handles one output dimension (tiisg = 0..31 maps to d = 0..255)
+    const uint d = tiisg;
+    if (d >= head_dim) return;
+
+    // Single pass over KV cache
+    for (uint s = 0; s < seq_len; s++) {
+        // Compute Q·K score
         float score = 0.0f;
-        for (uint d = 0; d < head_dim; d++) {
-            score += q[q_off + d] * k_cache[s * n_kv_heads * head_dim + kv_off + d];
+        device const float * k_ptr = k_cache + s * n_kv_heads * head_dim + kv_off;
+        for (uint dd = 0; dd < head_dim; dd++) {
+            score += q[q_off + dd] * k_ptr[dd];
         }
         score *= scale;
-        exp_sum += exp(score - max_score);
-    }
-    exp_sum = simd_sum(exp_sum);
-    const float inv_sum = 1.0f / exp_sum;
 
-    for (uint d = tiisg; d < head_dim; d += 32) {
-        float out_val = 0.0f;
-        for (uint s = 0; s < seq_len; s++) {
-            float score = 0.0f;
-            device const float * k_ptr = k_cache + s * n_kv_heads * head_dim + kv_off;
-            for (uint dd = 0; dd < head_dim; dd++) {
-                score += q[q_off + dd] * k_ptr[dd];
-            }
-            score *= scale;
-            const float attn_w = exp(score - max_score) * inv_sum;
-            out_val += attn_w * v_cache[s * n_kv_heads * head_dim + kv_off + d];
-        }
-        attn_out[q_off + d] = out_val;
+        // Online softmax update
+        const float new_max = max(max_score, score);
+        const float correction = exp(max_score - new_max);
+
+        // Update running stats
+        exp_sum = exp_sum * correction + exp(score - new_max);
+
+        // Update output with correction
+        const float v_val = v_cache[s * n_kv_heads * head_dim + kv_off + d];
+        out_local = out_local * correction + exp(score - new_max) * v_val;
+
+        max_score = new_max;
     }
+
+    // Final normalize
+    attn_out[q_off + d] = out_local / exp_sum;
 }
 
 kernel void sigmoid_gate(
