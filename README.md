@@ -1,14 +1,19 @@
 # ane-infer
 
+> **Apple Neural Engine (ANE) LLM Inference Engine** — reverse-engineered private APIs, Metal GPU compute shaders, hybrid ANE+GPU+CPU on Apple Silicon M1/M2/M3/M4/M5
+
 **Hybrid ANE+Metal+CPU inference engine for LLMs on Apple Silicon.**
 
 First implementation of Qwen3.5 (Gated DeltaNet + GQA) running natively on Apple Neural Engine via reverse-engineered private APIs. 32 tok/s Metal GPU decode matching llama.cpp, 3.6 TFLOPS fused ANE mega-kernels, built from scratch in Rust + Obj-C + Metal.
 
 Built on the shoulders of [maderix/ANE](https://github.com/maderix/ANE) — the project that cracked open ANE training. We took it further into inference with DeltaNet, Metal GPU shaders, and a complete decode pipeline.
 
+### Keywords
+`apple-neural-engine` `ane` `apple-silicon` `metal-gpu` `llm-inference` `on-device-ai` `neural-engine` `m1` `m2` `m3` `m4` `m5` `private-api` `reverse-engineering` `coreml` `gguf` `quantization` `q4` `q8` `deltanet` `qwen` `rust` `metal-shaders` `npu` `mlx-alternative` `llama-cpp-alternative` `macos` `ios` `edge-ai` `low-power-inference`
+
 ---
 
-## What This Is
+## What This Is — Apple Neural Engine LLM Inference
 
 A from-scratch LLM inference engine that runs Qwen3.5-2B on three Apple Silicon accelerators simultaneously:
 
@@ -26,7 +31,7 @@ No CoreML. No Python. No MLX. Just system frameworks + `objc_msgSend`.
 
 ---
 
-## Performance
+## Performance — ANE vs Metal GPU vs CPU on Apple Silicon
 
 **Qwen3.5-2B Q8_0 on Apple M5 (same chip as llama.cpp benchmarks)**
 
@@ -38,7 +43,7 @@ No CoreML. No Python. No MLX. Just system frameworks + `objc_msgSend`.
 | ANE prefill pp16 | 33 tok/s | ~3W | Fused FFN mega-kernel |
 | ANE fused FFN | **3.6 TFLOPS** | ~3W | 3x single-op throughput |
 
-## ANE Reverse Engineering
+## Apple Neural Engine (ANE) Reverse Engineering — Private API Discoveries
 
 We went deeper than anyone into Apple's private Neural Engine framework. Key discoveries:
 
@@ -78,7 +83,7 @@ The ANE compiler handles weight blobs >32MB SRAM automatically via DRAM spilling
 
 ---
 
-## Metal GPU Decode
+## Metal GPU Compute Shaders for LLM Decode on Apple Silicon
 
 13 custom Metal compute shaders encode the entire DeltaNet + FullAttention forward pass into **one command buffer per token**:
 
@@ -115,7 +120,7 @@ The ANE compiler handles weight blobs >32MB SRAM automatically via DRAM spilling
 
 ---
 
-## Architecture
+## Architecture — Hybrid ANE + Metal GPU + CPU Pipeline
 
 ```
                     ┌─────────────┐
@@ -243,7 +248,7 @@ crates/
 
 ---
 
-## Limitations
+## Limitations — Apple Neural Engine Private API Caveats
 
 - **Private APIs**: Uses `_ANEClient`, `_ANEInMemoryModel`, etc. Will break on macOS updates.
 - **Q6K dequant**: Partially broken — Q4 models with Q6K embeddings produce degraded output.
