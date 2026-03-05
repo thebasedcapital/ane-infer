@@ -74,7 +74,11 @@ fn outer_product_add(
 /// Avoids per-dispatch Metal buffer allocation.
 fn make_gemv_params(device: &metal::Device, w: &GpuBuffer) -> metal::Buffer {
     let params: [u32; 2] = [w.n_blocks, w.m as u32];
-    device.new_buffer_with_data(params.as_ptr() as *const _, 8, metal::MTLResourceOptions::StorageModeShared)
+    device.new_buffer_with_data(
+        params.as_ptr() as *const _,
+        8,
+        metal::MTLResourceOptions::StorageModeShared,
+    )
 }
 
 pub struct GpuDeltaNetLayerWeights {
@@ -96,14 +100,14 @@ pub struct GpuDeltaNetLayerWeights {
     pub ffn_up_params: metal::Buffer,
     pub ffn_down_params: metal::Buffer,
     // Small FP32 buffers (uploaded once)
-    pub ssm_a_buf: metal::Buffer,       // [n_heads]
-    pub dt_bias_buf: metal::Buffer,     // [n_heads]
-    pub ssm_norm_buf: metal::Buffer,    // [head_dim]
-    pub conv1d_buf: metal::Buffer,      // [inner_size * kernel_size]
-    pub attn_norm_buf: metal::Buffer,   // [dim]
+    pub ssm_a_buf: metal::Buffer,          // [n_heads]
+    pub dt_bias_buf: metal::Buffer,        // [n_heads]
+    pub ssm_norm_buf: metal::Buffer,       // [head_dim]
+    pub conv1d_buf: metal::Buffer,         // [inner_size * kernel_size]
+    pub attn_norm_buf: metal::Buffer,      // [dim]
     pub post_attn_norm_buf: metal::Buffer, // [dim]
     // Persistent state buffers (survive across tokens)
-    pub conv_state_buf: metal::Buffer,  // [inner_size * kernel_size]
+    pub conv_state_buf: metal::Buffer, // [inner_size * kernel_size]
     pub recurrent_state_buf: metal::Buffer, // [n_heads * key_dim * value_dim]
 }
 
@@ -115,6 +119,22 @@ pub struct GpuFullAttnLayerWeights {
     pub ffn_gate: GpuBuffer,
     pub ffn_up: GpuBuffer,
     pub ffn_down: GpuBuffer,
+    // Pre-allocated GEMV params
+    pub wq_params: metal::Buffer,
+    pub wk_params: metal::Buffer,
+    pub wv_params: metal::Buffer,
+    pub wo_params: metal::Buffer,
+    pub ffn_gate_params: metal::Buffer,
+    pub ffn_up_params: metal::Buffer,
+    pub ffn_down_params: metal::Buffer,
+    // FP32 norm weights
+    pub q_norm_buf: metal::Buffer,
+    pub k_norm_buf: metal::Buffer,
+    pub attn_norm_buf: metal::Buffer,
+    pub post_attn_norm_buf: metal::Buffer,
+    // KV cache buffers (pre-allocated for max_seq_len * n_kv_heads * head_dim)
+    pub k_cache_buf: metal::Buffer,
+    pub v_cache_buf: metal::Buffer,
 }
 
 pub enum GpuLayerWeights {
@@ -193,14 +213,53 @@ pub fn upload_model_weights(gpu: &GpuContext, model: &Qwen35ModelWeights) -> Gpu
                 }));
             }
             HybridLayerWeights::FullAttention(w) => {
+                let n_kv_heads = model.config.base.n_kv_heads;
+                let head_dim = model.config.base.head_dim;
+                let max_seq_len = model.config.base.max_seq_len;
+
+                let upload_f32 = |data: &[f32]| -> metal::Buffer {
+                    gpu.device.new_buffer_with_data(
+                        data.as_ptr() as *const _,
+                        (data.len() * 4) as u64,
+                        metal::MTLResourceOptions::StorageModeShared,
+                    )
+                };
+
+                let wq_g = gpu.upload_q8_weights(&w.wq);
+                let wk_g = gpu.upload_q8_weights(&w.wk);
+                let wv_g = gpu.upload_q8_weights(&w.wv);
+                let wo_g = gpu.upload_q8_weights(&w.wo);
+                let fg = gpu.upload_q8_weights(&w.ffn.gate);
+                let fu = gpu.upload_q8_weights(&w.ffn.up);
+                let fd = gpu.upload_q8_weights(&w.ffn.down);
+
+                let kv_cache_size = (max_seq_len * n_kv_heads * head_dim * 4) as u64;
+
                 layers.push(GpuLayerWeights::FullAttention(GpuFullAttnLayerWeights {
-                    wq: gpu.upload_q8_weights(&w.wq),
-                    wk: gpu.upload_q8_weights(&w.wk),
-                    wv: gpu.upload_q8_weights(&w.wv),
-                    wo: gpu.upload_q8_weights(&w.wo),
-                    ffn_gate: gpu.upload_q8_weights(&w.ffn.gate),
-                    ffn_up: gpu.upload_q8_weights(&w.ffn.up),
-                    ffn_down: gpu.upload_q8_weights(&w.ffn.down),
+                    wq_params: make_gemv_params(&gpu.device, &wq_g),
+                    wk_params: make_gemv_params(&gpu.device, &wk_g),
+                    wv_params: make_gemv_params(&gpu.device, &wv_g),
+                    wo_params: make_gemv_params(&gpu.device, &wo_g),
+                    ffn_gate_params: make_gemv_params(&gpu.device, &fg),
+                    ffn_up_params: make_gemv_params(&gpu.device, &fu),
+                    ffn_down_params: make_gemv_params(&gpu.device, &fd),
+                    q_norm_buf: upload_f32(&w.q_norm),
+                    k_norm_buf: upload_f32(&w.k_norm),
+                    attn_norm_buf: upload_f32(&w.attn_norm),
+                    post_attn_norm_buf: upload_f32(&w.post_attn_norm),
+                    k_cache_buf: gpu
+                        .device
+                        .new_buffer(kv_cache_size, metal::MTLResourceOptions::StorageModeShared),
+                    v_cache_buf: gpu
+                        .device
+                        .new_buffer(kv_cache_size, metal::MTLResourceOptions::StorageModeShared),
+                    wq: wq_g,
+                    wk: wk_g,
+                    wv: wv_g,
+                    wo: wo_g,
+                    ffn_gate: fg,
+                    ffn_up: fu,
+                    ffn_down: fd,
                 }));
             }
         }
@@ -209,7 +268,11 @@ pub fn upload_model_weights(gpu: &GpuContext, model: &Qwen35ModelWeights) -> Gpu
     let lm_head = gpu.upload_q8_weights(&model.lm_head);
     let lm_head_params = make_gemv_params(&gpu.device, &lm_head);
 
-    GpuModelWeights { layers, lm_head, lm_head_params }
+    GpuModelWeights {
+        layers,
+        lm_head,
+        lm_head_params,
+    }
 }
 
 struct ScratchLayout {

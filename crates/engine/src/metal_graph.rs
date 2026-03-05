@@ -60,6 +60,11 @@ pub struct GpuContext {
     pub residual_add_pipeline: ComputePipelineState,
     pub gpu_memcpy_pipeline: ComputePipelineState,
     pub silu_inplace_pipeline: ComputePipelineState,
+    // Full attention shaders
+    pub rope_apply_pipeline: ComputePipelineState,
+    pub sdpa_causal_pipeline: ComputePipelineState,
+    pub sigmoid_gate_pipeline: ComputePipelineState,
+    pub q_gate_split_pipeline: ComputePipelineState,
     // Scratch buffers
     pub scratch_input: Buffer,
     pub scratch_output: Buffer,
@@ -91,9 +96,11 @@ impl GpuContext {
 
         // Load DeltaNet recurrence shaders
         let load_pipeline = |name: &str| -> Result<ComputePipelineState> {
-            let f = library.get_function(name, None)
+            let f = library
+                .get_function(name, None)
                 .map_err(|e| anyhow::anyhow!("{name} not found: {e}"))?;
-            device.new_compute_pipeline_state_with_function(&f)
+            device
+                .new_compute_pipeline_state_with_function(&f)
                 .map_err(|e| anyhow::anyhow!("{name} pipeline failed: {e}"))
         };
 
@@ -106,6 +113,12 @@ impl GpuContext {
         let residual_add_pipeline = load_pipeline("residual_add")?;
         let gpu_memcpy_pipeline = load_pipeline("gpu_memcpy")?;
         let silu_inplace_pipeline = load_pipeline("silu_inplace")?;
+
+        // Load Full attention shaders
+        let rope_apply_pipeline = load_pipeline("rope_apply")?;
+        let sdpa_causal_pipeline = load_pipeline("sdpa_causal")?;
+        let sigmoid_gate_pipeline = load_pipeline("sigmoid_gate")?;
+        let q_gate_split_pipeline = load_pipeline("q_gate_split")?;
 
         let scratch_input_size = 128 * 1024;
         let scratch_output_size = 4 * 1024 * 1024;
@@ -133,6 +146,10 @@ impl GpuContext {
             residual_add_pipeline,
             gpu_memcpy_pipeline,
             silu_inplace_pipeline,
+            rope_apply_pipeline,
+            sdpa_causal_pipeline,
+            sigmoid_gate_pipeline,
+            q_gate_split_pipeline,
             scratch_input,
             scratch_output,
             scratch_input_size,
@@ -226,7 +243,9 @@ pub struct GpuGraph<'a> {
 
 impl<'a> GpuGraph<'a> {
     pub fn new(ctx: &'a GpuContext) -> Self {
-        let params_buf = ctx.device.new_buffer(256, MTLResourceOptions::StorageModeShared);
+        let params_buf = ctx
+            .device
+            .new_buffer(256, MTLResourceOptions::StorageModeShared);
         Self {
             ctx,
             ops: Vec::new(),
@@ -341,7 +360,10 @@ impl<'a> GpuGraph<'a> {
                     encoder.set_buffer(2, Some(&n_buf), 0);
                     let threads = MTLSize::new(n as u64, 1, 1);
                     let tg_size = MTLSize::new(
-                        self.ctx.silu_pipeline.thread_execution_width().min(n as u64),
+                        self.ctx
+                            .silu_pipeline
+                            .thread_execution_width()
+                            .min(n as u64),
                         1,
                         1,
                     );
@@ -411,7 +433,7 @@ impl<'a> GpuGraph<'a> {
                         Some(&self.ctx.scratch_output),
                         (op.output_offset * 4) as u64,
                     );
-                    encoder.set_buffer(3, Some(&params), po as u64);      // n_blocks
+                    encoder.set_buffer(3, Some(&params), po as u64); // n_blocks
                     encoder.set_buffer(4, Some(&params), (po + 4) as u64); // m
 
                     let tg_count = MTLSize::new(((m as u64) + 1) / 2, 1, 1);
@@ -436,7 +458,10 @@ impl<'a> GpuGraph<'a> {
                     encoder.set_buffer(2, Some(&params), po as u64);
                     let threads = MTLSize::new(n as u64, 1, 1);
                     let tg_size = MTLSize::new(
-                        self.ctx.silu_pipeline.thread_execution_width().min(n as u64),
+                        self.ctx
+                            .silu_pipeline
+                            .thread_execution_width()
+                            .min(n as u64),
                         1,
                         1,
                     );
