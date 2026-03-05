@@ -47,6 +47,9 @@ pub struct GpuLayerScratch {
 /// Written once at init, never changes between tokens.
 pub struct GpuConstantPool {
     pub buf: Buffer,
+    // Small 4-byte buffers for per-dispatch constants (pos changes each token)
+    pub pos_buf: Buffer,
+    pub seq_len_buf: Buffer,
 }
 
 impl GpuConstantPool {
@@ -54,7 +57,7 @@ impl GpuConstantPool {
     // 0: dim
     // 4: inner_size
     // 8: hidden_dim
-    // 12: n_heads
+    // 12: n_heads (DeltaNet)
     // 16: head_dim_k (chunk / n_heads)
     // 20: chunk (inner_size / 3)
     // 24: eps (f32)
@@ -66,6 +69,14 @@ impl GpuConstantPool {
     // 48: scale_1 (1.0f32)
     // 52: has_gate (1u32)
     // 56: zero (0u32)
+    // --- FullAttention constants (starting at 60) ---
+    // 60: n_heads_attn (8)
+    // 64: n_kv_heads (2)
+    // 68: head_dim_attn (256)
+    // 72: rope_freq_base (f32)
+    // 76: scale_attn (1/sqrt(head_dim), f32)
+    // 80: q_dim (n_heads_attn * head_dim)
+    // 84: kv_dim (n_kv_heads * head_dim)
     pub const DIM: usize = 0;
     pub const INNER_SIZE: usize = 4;
     pub const HIDDEN_DIM: usize = 8;
@@ -81,6 +92,14 @@ impl GpuConstantPool {
     pub const SCALE_1: usize = 48;
     pub const HAS_GATE: usize = 52;
     pub const ZERO: usize = 56;
+    // FullAttention
+    pub const N_HEADS_ATTN: usize = 60;
+    pub const N_KV_HEADS: usize = 64;
+    pub const HEAD_DIM_ATTN: usize = 68;
+    pub const ROPE_FREQ_BASE: usize = 72;
+    pub const SCALE_ATTN: usize = 76;
+    pub const Q_DIM: usize = 80;
+    pub const KV_DIM: usize = 84;
 
     pub fn new(
         device: &Device,
@@ -91,12 +110,19 @@ impl GpuConstantPool {
         key_dim: usize,
         kernel_size: usize,
         eps: f32,
+        n_heads_attn: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        rope_freq_base: f32,
     ) -> Self {
         let buf = device.new_buffer(256, MTLResourceOptions::StorageModeShared);
         let ptr = buf.contents() as *mut u32;
         let chunk = inner_size / 3;
         let head_dim_k = chunk / n_heads;
         let scale = 1.0f32 / (key_dim as f32).sqrt();
+        let scale_attn = 1.0f32 / (head_dim as f32).sqrt();
+        let q_dim = n_heads_attn * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
         unsafe {
             *ptr.add(0) = dim as u32;
             *ptr.add(1) = inner_size as u32;
@@ -113,8 +139,35 @@ impl GpuConstantPool {
             *(ptr.add(12) as *mut f32) = 1.0f32;
             *ptr.add(13) = 1u32; // has_gate
             *ptr.add(14) = 0u32; // zero
+                                 // FullAttention constants
+            *ptr.add(15) = n_heads_attn as u32;
+            *ptr.add(16) = n_kv_heads as u32;
+            *ptr.add(17) = head_dim as u32;
+            *(ptr.add(18) as *mut f32) = rope_freq_base;
+            *(ptr.add(19) as *mut f32) = scale_attn;
+            *ptr.add(20) = q_dim as u32;
+            *ptr.add(21) = kv_dim as u32;
         }
-        Self { buf }
+        // Small buffers for per-token constants (pos, seq_len)
+        let pos_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+        let seq_len_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+        Self {
+            buf,
+            pos_buf,
+            seq_len_buf,
+        }
+    }
+
+    pub fn set_pos(&self, pos: u32) {
+        unsafe {
+            *(self.pos_buf.contents() as *mut u32) = pos;
+        }
+    }
+
+    pub fn set_seq_len(&self, seq_len: u32) {
+        unsafe {
+            *(self.seq_len_buf.contents() as *mut u32) = seq_len;
+        }
     }
 }
 

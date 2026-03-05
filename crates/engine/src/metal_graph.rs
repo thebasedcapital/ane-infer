@@ -49,6 +49,7 @@ pub struct GpuContext {
     pub device: Device,
     pub queue: CommandQueue,
     pub gemv_pipeline: ComputePipelineState,
+    pub q4_gemv_pipeline: ComputePipelineState,
     pub silu_pipeline: ComputePipelineState,
     // DeltaNet recurrence shaders
     pub conv1d_silu_pipeline: ComputePipelineState,
@@ -86,6 +87,13 @@ impl GpuContext {
         let gemv_pipeline = device
             .new_compute_pipeline_state_with_function(&gemv_fn)
             .map_err(|e| anyhow::anyhow!("pipeline creation failed: {e}"))?;
+
+        let q4_gemv_fn = library
+            .get_function("q4_gemv", None)
+            .map_err(|e| anyhow::anyhow!("q4_gemv not found: {e}"))?;
+        let q4_gemv_pipeline = device
+            .new_compute_pipeline_state_with_function(&q4_gemv_fn)
+            .map_err(|e| anyhow::anyhow!("q4_gemv pipeline creation failed: {e}"))?;
 
         let silu_fn = library
             .get_function("silu_mul", None)
@@ -136,6 +144,7 @@ impl GpuContext {
             device,
             queue,
             gemv_pipeline,
+            q4_gemv_pipeline,
             silu_pipeline,
             conv1d_silu_pipeline,
             l2_norm_scale_pipeline,
@@ -197,6 +206,21 @@ impl GpuContext {
             m: q8.m,
             n: q8.n,
             n_blocks: (q8.n / 32) as u32,
+        }
+    }
+
+    /// Upload Q4_0 weight matrix to GPU (call once at model load).
+    pub fn upload_q4_weights(&self, q4: &crate::q8_gemv::Q4Tensor) -> GpuBuffer {
+        let buffer = self.device.new_buffer_with_data(
+            q4.data.as_ptr() as *const _,
+            q4.data.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        GpuBuffer {
+            buffer,
+            m: q4.m,
+            n: q4.n,
+            n_blocks: (q4.n / 32) as u32,
         }
     }
 

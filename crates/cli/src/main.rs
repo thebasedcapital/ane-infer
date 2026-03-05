@@ -441,6 +441,10 @@ fn cmd_bench(args: &[String]) -> Result<()> {
                 config.ssm_state_size,
                 4, // kernel_size=4 default
                 c.rms_norm_eps,
+                c.n_heads,
+                c.n_kv_heads,
+                c.head_dim,
+                c.rope_freq_base,
             );
 
             let first_token = greedy_sample(&last_logits, 0.0);
