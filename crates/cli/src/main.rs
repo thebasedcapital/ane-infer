@@ -1670,14 +1670,23 @@ fn load_model_weights(
     })
 }
 
-/// Load Q8_0 tensor as Q8Tensor (no dequantization).
-fn load_q8(
+/// Load quantized tensor (Q4_0, Q8_0, or Q6K) as Q8Tensor with quant_type flag.
+fn load_quant(
     gguf: &ane_gguf::GgufFile,
     file_data: &[u8],
     name: &str,
 ) -> Result<ane_engine::q8_gemv::Q8Tensor> {
-    let (data, ne0, ne1) = ane_gguf::extract_tensor_raw(gguf, file_data, name)?;
-    Ok(ane_engine::q8_gemv::Q8Tensor::from_raw(data, ne0, ne1))
+    use ane_engine::q8_gemv::QuantType;
+    let (data, ne0, ne1, ggml_type) = ane_gguf::extract_tensor_raw(gguf, file_data, name)?;
+    let quant_type = match ggml_type {
+        ane_gguf::GgmlType::Q8_0 => QuantType::Q8_0,
+        ane_gguf::GgmlType::Q4_0 => QuantType::Q4_0,
+        ane_gguf::GgmlType::Q6K => QuantType::Q6K,
+        _ => anyhow::bail!("unsupported quantization type: {:?}", ggml_type),
+    };
+    Ok(ane_engine::q8_gemv::Q8Tensor::from_raw(
+        data, ne0, ne1, quant_type,
+    ))
 }
 
 /// Load Qwen3.5 model with Q8_0 weights (no dequantization for projections).
@@ -1690,8 +1699,8 @@ fn load_qwen35_q8(
 
     let embedding = ane_gguf::extract_embedding(gguf, file_data)?; // FP32 for table lookup
     let final_norm = ane_gguf::extract_final_norm(gguf, file_data)?;
-    let lm_head = load_q8(gguf, file_data, "output.weight")
-        .or_else(|_| load_q8(gguf, file_data, "token_embd.weight"))?;
+    let lm_head = load_quant(gguf, file_data, "output.weight")
+        .or_else(|_| load_quant(gguf, file_data, "token_embd.weight"))?;
 
     let c = &config.base;
     let mut layers: Vec<HybridLayerWeights> = Vec::with_capacity(c.n_layers);
@@ -1710,11 +1719,11 @@ fn load_qwen35_q8(
                     file_data,
                     &format!("blk.{l}.post_attention_norm.weight"),
                 )?,
-                qkv: load_q8(gguf, file_data, &format!("blk.{l}.attn_qkv.weight"))?,
-                attn_gate: load_q8(gguf, file_data, &format!("blk.{l}.attn_gate.weight"))?,
+                qkv: load_quant(gguf, file_data, &format!("blk.{l}.attn_qkv.weight"))?,
+                attn_gate: load_quant(gguf, file_data, &format!("blk.{l}.attn_gate.weight"))?,
                 ssm_a: ane_gguf::extract_tensor_f32(gguf, file_data, &format!("blk.{l}.ssm_a"))?,
-                ssm_alpha: load_q8(gguf, file_data, &format!("blk.{l}.ssm_alpha.weight"))?,
-                ssm_beta: load_q8(gguf, file_data, &format!("blk.{l}.ssm_beta.weight"))?,
+                ssm_alpha: load_quant(gguf, file_data, &format!("blk.{l}.ssm_alpha.weight"))?,
+                ssm_beta: load_quant(gguf, file_data, &format!("blk.{l}.ssm_beta.weight"))?,
                 ssm_conv1d: ane_gguf::extract_tensor_f32(
                     gguf,
                     file_data,
@@ -1730,11 +1739,11 @@ fn load_qwen35_q8(
                     file_data,
                     &format!("blk.{l}.ssm_norm.weight"),
                 )?,
-                ssm_out: load_q8(gguf, file_data, &format!("blk.{l}.ssm_out.weight"))?,
+                ssm_out: load_quant(gguf, file_data, &format!("blk.{l}.ssm_out.weight"))?,
                 ffn: FfnWeights {
-                    gate: load_q8(gguf, file_data, &format!("blk.{l}.ffn_gate.weight"))?,
-                    up: load_q8(gguf, file_data, &format!("blk.{l}.ffn_up.weight"))?,
-                    down: load_q8(gguf, file_data, &format!("blk.{l}.ffn_down.weight"))?,
+                    gate: load_quant(gguf, file_data, &format!("blk.{l}.ffn_gate.weight"))?,
+                    up: load_quant(gguf, file_data, &format!("blk.{l}.ffn_up.weight"))?,
+                    down: load_quant(gguf, file_data, &format!("blk.{l}.ffn_down.weight"))?,
                 },
             })
         } else {
@@ -1749,10 +1758,10 @@ fn load_qwen35_q8(
                     file_data,
                     &format!("blk.{l}.post_attention_norm.weight"),
                 )?,
-                wq: load_q8(gguf, file_data, &format!("blk.{l}.attn_q.weight"))?,
-                wk: load_q8(gguf, file_data, &format!("blk.{l}.attn_k.weight"))?,
-                wv: load_q8(gguf, file_data, &format!("blk.{l}.attn_v.weight"))?,
-                wo: load_q8(gguf, file_data, &format!("blk.{l}.attn_output.weight"))?,
+                wq: load_quant(gguf, file_data, &format!("blk.{l}.attn_q.weight"))?,
+                wk: load_quant(gguf, file_data, &format!("blk.{l}.attn_k.weight"))?,
+                wv: load_quant(gguf, file_data, &format!("blk.{l}.attn_v.weight"))?,
+                wo: load_quant(gguf, file_data, &format!("blk.{l}.attn_output.weight"))?,
                 q_norm: ane_gguf::extract_tensor_f32(
                     gguf,
                     file_data,
@@ -1764,9 +1773,9 @@ fn load_qwen35_q8(
                     &format!("blk.{l}.attn_k_norm.weight"),
                 )?,
                 ffn: FfnWeights {
-                    gate: load_q8(gguf, file_data, &format!("blk.{l}.ffn_gate.weight"))?,
-                    up: load_q8(gguf, file_data, &format!("blk.{l}.ffn_up.weight"))?,
-                    down: load_q8(gguf, file_data, &format!("blk.{l}.ffn_down.weight"))?,
+                    gate: load_quant(gguf, file_data, &format!("blk.{l}.ffn_gate.weight"))?,
+                    up: load_quant(gguf, file_data, &format!("blk.{l}.ffn_up.weight"))?,
+                    down: load_quant(gguf, file_data, &format!("blk.{l}.ffn_down.weight"))?,
                 },
             })
         };

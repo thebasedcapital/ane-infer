@@ -2,9 +2,9 @@
 //!
 //! ANE requires FP16 weights, so we dequantize from Q4_0/Q8_0 etc.
 
-use half::f16;
-use anyhow::{Result, bail};
 use super::parser::GgmlType;
+use anyhow::{bail, Result};
+use half::f16;
 
 /// Dequantize Q4_0 block to FP32.
 /// Block format: 2 bytes (f16 scale) + 16 bytes (32 × 4-bit values)
@@ -84,6 +84,49 @@ pub fn dequant_q4_k_block(block: &[u8], out: &mut [f32]) {
     }
 }
 
+/// Dequantize Q6_K block to FP32.
+/// Q6_K format: 256 elements per block, 210 bytes per block
+/// Layout: 2 bytes (f16 d) + 2 bytes (f16 dmin) + 12 bytes (scales) + 2 bytes (padding) + 192 bytes (6-bit quants)
+pub fn dequant_q6_k_block(block: &[u8], out: &mut [f32]) {
+    assert!(block.len() >= 210);
+    assert!(out.len() >= 256);
+
+    let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
+    let scales = &block[4..16];
+    let quants = &block[18..210];
+
+    for j in 0..8 {
+        let sc = scales[j] as f32;
+        let scale = d * sc;
+
+        // Each group of 32 elements uses 24 bytes (32 × 6 bits = 192 bits = 24 bytes)
+        let q_offset = j * 24;
+
+        for l in 0..32 {
+            // Extract 6-bit value from the packed stream
+            let bit_offset = l * 6;
+            let byte_idx = q_offset + bit_offset / 8;
+            let bit_in_byte = bit_offset % 8;
+
+            let val = if bit_in_byte <= 2 {
+                // Value fits in one byte
+                ((quants[byte_idx] >> bit_in_byte) & 0x3F) as i32
+            } else {
+                // Value spans two bytes
+                let lo = (quants[byte_idx] >> bit_in_byte) as u32;
+                let hi = quants[byte_idx + 1] as u32;
+                let val = lo | (hi << (8 - bit_in_byte));
+                (val & 0x3F) as i32
+            };
+
+            // 6-bit signed: subtract 32 to center
+            let signed_val = val - 32;
+            out[j * 32 + l] = signed_val as f32 * scale;
+        }
+    }
+}
+
 /// Dequantize a full tensor from GGML quantized format to FP32.
 pub fn dequantize_tensor(data: &[u8], typ: GgmlType, n_elements: usize) -> Result<Vec<f32>> {
     let block_size = typ.block_size();
@@ -99,7 +142,10 @@ pub fn dequantize_tensor(data: &[u8], typ: GgmlType, n_elements: usize) -> Resul
             for i in 0..n_elements {
                 let offset = i * 4;
                 out[i] = f32::from_le_bytes([
-                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
                 ]);
             }
             Ok(out)
@@ -147,6 +193,19 @@ pub fn dequantize_tensor(data: &[u8], typ: GgmlType, n_elements: usize) -> Resul
                 let end = (start + block_size).min(n_elements);
                 let mut tmp = [0f32; 256];
                 dequant_q4_k_block(block, &mut tmp);
+                out[start..end].copy_from_slice(&tmp[..end - start]);
+            }
+            Ok(out)
+        }
+        GgmlType::Q6K => {
+            let n_blocks = (n_elements + block_size - 1) / block_size;
+            let mut out = vec![0f32; n_elements];
+            for b in 0..n_blocks {
+                let block = &data[b * bytes_per_block..];
+                let start = b * block_size;
+                let end = (start + block_size).min(n_elements);
+                let mut tmp = [0f32; 256];
+                dequant_q6_k_block(block, &mut tmp);
                 out[start..end].copy_from_slice(&tmp[..end - start]);
             }
             Ok(out)

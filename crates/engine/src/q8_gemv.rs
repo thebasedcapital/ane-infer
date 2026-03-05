@@ -2,19 +2,22 @@
 //!
 //! Parallelizes across output rows with rayon, NEON for inner dot product.
 
+use ane_gguf::dequant_q6_k_block;
 use half::f16;
 use rayon::prelude::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantType {
+    Q4_0 = 2,
+    Q8_0 = 8,
+    Q6K = 14,
+}
 
 pub struct Q8Tensor {
     pub data: Vec<u8>,
     pub m: usize,
     pub n: usize,
-}
-
-pub struct Q4Tensor {
-    pub data: Vec<u8>,
-    pub m: usize,
-    pub n: usize,
+    pub quant_type: QuantType,
 }
 
 const Q8_BLOCK: usize = 32;
@@ -23,37 +26,34 @@ const Q8_BYTES: usize = 34;
 const Q4_BLOCK: usize = 32;
 const Q4_BYTES: usize = 18;
 
-impl Q8Tensor {
-    pub fn from_raw(data: Vec<u8>, ne0: usize, ne1: usize) -> Self {
-        let m = ne1;
-        let n = ne0;
-        assert_eq!(n % Q8_BLOCK, 0);
-        let expected = m * (n / Q8_BLOCK) * Q8_BYTES;
-        assert_eq!(
-            data.len(),
-            expected,
-            "Q8 size mismatch: got {}, expected {} (m={m}, n={n})",
-            data.len(),
-            expected
-        );
-        Self { data, m, n }
-    }
-}
+const Q6K_BLOCK: usize = 256;
+const Q6K_BYTES: usize = 210;
 
-impl Q4Tensor {
-    pub fn from_raw(data: Vec<u8>, ne0: usize, ne1: usize) -> Self {
+impl Q8Tensor {
+    pub fn from_raw(data: Vec<u8>, ne0: usize, ne1: usize, quant_type: QuantType) -> Self {
         let m = ne1;
         let n = ne0;
-        assert_eq!(n % Q4_BLOCK, 0);
-        let expected = m * (n / Q4_BLOCK) * Q4_BYTES;
+        let (block_size, bytes_per_block) = match quant_type {
+            QuantType::Q8_0 => (Q8_BLOCK, Q8_BYTES),
+            QuantType::Q4_0 => (Q4_BLOCK, Q4_BYTES),
+            QuantType::Q6K => (Q6K_BLOCK, Q6K_BYTES),
+        };
+        assert_eq!(n % block_size, 0, "n must be divisible by {}", block_size);
+        let expected = m * (n / block_size) * bytes_per_block;
         assert_eq!(
             data.len(),
             expected,
-            "Q4 size mismatch: got {}, expected {} (m={m}, n={n})",
+            "Quant size mismatch: got {}, expected {} (m={m}, n={n}, type={:?})",
             data.len(),
-            expected
+            expected,
+            quant_type
         );
-        Self { data, m, n }
+        Self {
+            data,
+            m,
+            n,
+            quant_type,
+        }
     }
 }
 
@@ -63,7 +63,9 @@ fn q4_unpack(byte: u8, offset: usize) -> f32 {
     (nibble - 8) as f32
 }
 
-pub fn q4_gemv(w: &Q4Tensor, x: &[f32], y: &mut [f32]) {
+/// CPU Q4_0 GEMV: y = W @ x
+pub fn q4_gemv_cpu(w: &Q8Tensor, x: &[f32], y: &mut [f32]) {
+    assert_eq!(w.quant_type, QuantType::Q4_0);
     assert_eq!(x.len(), w.n);
     assert_eq!(y.len(), w.m);
 
@@ -94,8 +96,45 @@ fn compute_row_q4(data: &[u8], x: &[f32], row: usize, bpr: usize) -> f32 {
     sum
 }
 
+/// CPU Q6K GEMV: y = W @ x (dequantizes blocks on-the-fly)
+pub fn q6k_gemv_cpu(w: &Q8Tensor, x: &[f32], y: &mut [f32]) {
+    assert_eq!(w.quant_type, QuantType::Q6K);
+    assert_eq!(x.len(), w.n);
+    assert_eq!(y.len(), w.m);
+
+    let bpr = w.n / Q6K_BLOCK;
+    let data = &w.data;
+
+    y.par_iter_mut().enumerate().for_each(|(row, y_out)| {
+        *y_out = compute_row_q6k(data, x, row, bpr);
+    });
+}
+
+fn compute_row_q6k(data: &[u8], x: &[f32], row: usize, bpr: usize) -> f32 {
+    let row_off = row * bpr * Q6K_BYTES;
+    let mut sum = 0.0f32;
+    let mut block = [0f32; 256];
+
+    for b in 0..bpr {
+        let off = row_off + b * Q6K_BYTES;
+        dequant_q6_k_block(&data[off..], &mut block);
+        for i in 0..256 {
+            sum += block[i] * x[b * 256 + i];
+        }
+    }
+    sum
+}
+
 /// Multi-threaded Q8_0 GEMV: y = W @ x
 pub fn q8_gemv(w: &Q8Tensor, x: &[f32], y: &mut [f32]) {
+    match w.quant_type {
+        QuantType::Q8_0 => q8_gemv_impl(w, x, y),
+        QuantType::Q4_0 => q4_gemv_cpu(w, x, y),
+        QuantType::Q6K => q6k_gemv_cpu(w, x, y),
+    }
+}
+
+fn q8_gemv_impl(w: &Q8Tensor, x: &[f32], y: &mut [f32]) {
     assert_eq!(x.len(), w.n);
     assert_eq!(y.len(), w.m);
 
@@ -227,7 +266,7 @@ mod tests {
                 data[off + 2 + row] = 1i8 as u8;
             }
         }
-        let w = Q8Tensor::from_raw(data, n, m);
+        let w = Q8Tensor::from_raw(data, n, m, QuantType::Q8_0);
         let x: Vec<f32> = (0..32).map(|i| i as f32).collect();
         let mut y = vec![0f32; m];
         q8_gemv(&w, &x, &mut y);
@@ -256,7 +295,7 @@ mod tests {
                 }
             }
         }
-        let w = Q8Tensor::from_raw(data, n, m);
+        let w = Q8Tensor::from_raw(data, n, m, QuantType::Q8_0);
         let x: Vec<f32> = (0..n).map(|i| (i % 100) as f32).collect();
         let mut y = vec![0f32; m];
         q8_gemv(&w, &x, &mut y);

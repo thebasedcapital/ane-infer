@@ -900,6 +900,7 @@ impl CloneBuffer for GpuBuffer {
             m: self.m,
             n: self.n,
             n_blocks: self.n_blocks,
+            quant_type: self.quant_type,
         }
     }
 }

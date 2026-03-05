@@ -8,7 +8,7 @@ use anyhow::{bail, Result};
 use metal::*;
 use std::path::Path;
 
-use crate::q8_gemv::Q8Tensor;
+use crate::q8_gemv::{Q8Tensor, QuantType};
 
 /// A weight matrix uploaded to GPU memory (one-time at model load).
 pub struct GpuBuffer {
@@ -16,6 +16,7 @@ pub struct GpuBuffer {
     pub m: usize,
     pub n: usize,
     pub n_blocks: u32,
+    pub quant_type: QuantType,
 }
 
 /// A single GEMV operation in the computational graph.
@@ -195,33 +196,24 @@ impl GpuContext {
 
     /// Upload Q8 weight matrix to GPU (call once at model load).
     /// Creates a persistent GPU buffer that lives for the model's lifetime.
-    pub fn upload_q8_weights(&self, q8: &Q8Tensor) -> GpuBuffer {
+    pub fn upload_quant_weights(&self, q: &Q8Tensor) -> GpuBuffer {
         let buffer = self.device.new_buffer_with_data(
-            q8.data.as_ptr() as *const _,
-            q8.data.len() as u64,
+            q.data.as_ptr() as *const _,
+            q.data.len() as u64,
             MTLResourceOptions::StorageModeShared,
         );
         GpuBuffer {
             buffer,
-            m: q8.m,
-            n: q8.n,
-            n_blocks: (q8.n / 32) as u32,
+            m: q.m,
+            n: q.n,
+            n_blocks: (q.n / 32) as u32,
+            quant_type: q.quant_type,
         }
     }
 
-    /// Upload Q4_0 weight matrix to GPU (call once at model load).
-    pub fn upload_q4_weights(&self, q4: &crate::q8_gemv::Q4Tensor) -> GpuBuffer {
-        let buffer = self.device.new_buffer_with_data(
-            q4.data.as_ptr() as *const _,
-            q4.data.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        GpuBuffer {
-            buffer,
-            m: q4.m,
-            n: q4.n,
-            n_blocks: (q4.n / 32) as u32,
-        }
+    /// Legacy alias for upload_quant_weights
+    pub fn upload_q8_weights(&self, q8: &Q8Tensor) -> GpuBuffer {
+        self.upload_quant_weights(q8)
     }
 
     /// Get scratch buffer pointers for direct CPU access.

@@ -3,13 +3,17 @@
 //! Reshapes weights from [out, in] to [out, in, 1, 1] for 1x1 conv,
 //! converts to FP16, and packages with the ANE weight blob header.
 
-use anyhow::Result;
-use super::parser::GgufFile;
 use super::dequant::dequantize_tensor;
+use super::parser::{GgmlType, GgufFile};
+use anyhow::Result;
 
 /// Extract raw tensor bytes from GGUF without dequantization.
-/// Returns (raw_bytes, ne0, ne1) where ne0 is fast dim, ne1 is slow dim.
-pub fn extract_tensor_raw(gguf: &GgufFile, file_data: &[u8], name: &str) -> Result<(Vec<u8>, usize, usize)> {
+/// Returns (raw_bytes, ne0, ne1, quant_type) where ne0 is fast dim, ne1 is slow dim.
+pub fn extract_tensor_raw(
+    gguf: &GgufFile,
+    file_data: &[u8],
+    name: &str,
+) -> Result<(Vec<u8>, usize, usize, GgmlType)> {
     let tensor = gguf
         .get_tensor(name)
         .ok_or_else(|| anyhow::anyhow!("tensor not found: {name}"))?;
@@ -20,8 +24,9 @@ pub fn extract_tensor_raw(gguf: &GgufFile, file_data: &[u8], name: &str) -> Resu
 
     let ne0 = tensor.dimensions.first().copied().unwrap_or(0) as usize;
     let ne1 = tensor.dimensions.get(1).copied().unwrap_or(1) as usize;
+    let quant_type = tensor.typ;
 
-    Ok((data, ne0, ne1))
+    Ok((data, ne0, ne1, quant_type))
 }
 
 /// Extract a tensor from GGUF file data, dequantize to FP32.
@@ -73,11 +78,7 @@ pub fn extract_ffn_up_weights(
 }
 
 /// Extract FFN down weight (down_proj) for a layer.
-pub fn extract_ffn_down_weight(
-    gguf: &GgufFile,
-    file_data: &[u8],
-    layer: usize,
-) -> Result<Vec<u8>> {
+pub fn extract_ffn_down_weight(gguf: &GgufFile, file_data: &[u8], layer: usize) -> Result<Vec<u8>> {
     let w2 = extract_tensor_f32(gguf, file_data, &format!("blk.{layer}.ffn_down.weight"))?;
     Ok(build_ane_weight_blob(&[&w2]))
 }
@@ -103,12 +104,8 @@ pub fn extract_layer_norms(
     file_data: &[u8],
     layer: usize,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
-    let attn_norm = extract_tensor_f32(
-        gguf, file_data, &format!("blk.{layer}.attn_norm.weight")
-    )?;
-    let ffn_norm = extract_tensor_f32(
-        gguf, file_data, &format!("blk.{layer}.ffn_norm.weight")
-    )?;
+    let attn_norm = extract_tensor_f32(gguf, file_data, &format!("blk.{layer}.attn_norm.weight"))?;
+    let ffn_norm = extract_tensor_f32(gguf, file_data, &format!("blk.{layer}.ffn_norm.weight"))?;
     Ok((attn_norm, ffn_norm))
 }
 

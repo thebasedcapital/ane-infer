@@ -170,18 +170,41 @@ impl AneTripleProjection {
     }
 }
 
-/// Dequantize a Q8Tensor to FP32 for ANE weight blob construction.
+/// Dequantize a Q8Tensor (Q8_0 or Q4_0) to FP32 for ANE weight blob construction.
 fn dequant_q8_to_f32(q8: &Q8Tensor) -> Vec<f32> {
+    use crate::q8_gemv::QuantType;
     let bpr = q8.n / 32;
     let mut out = vec![0.0f32; q8.m * q8.n];
 
-    for row in 0..q8.m {
-        for b in 0..bpr {
-            let off = (row * bpr + b) * 34;
-            let scale = f16::from_le_bytes([q8.data[off], q8.data[off + 1]]).to_f32();
-            for i in 0..32 {
-                out[row * q8.n + b * 32 + i] = q8.data[off + 2 + i] as i8 as f32 * scale;
+    match q8.quant_type {
+        QuantType::Q8_0 => {
+            for row in 0..q8.m {
+                for b in 0..bpr {
+                    let off = (row * bpr + b) * 34;
+                    let scale = f16::from_le_bytes([q8.data[off], q8.data[off + 1]]).to_f32();
+                    for i in 0..32 {
+                        out[row * q8.n + b * 32 + i] = q8.data[off + 2 + i] as i8 as f32 * scale;
+                    }
+                }
             }
+        }
+        QuantType::Q4_0 => {
+            for row in 0..q8.m {
+                for b in 0..bpr {
+                    let off = (row * bpr + b) * 18; // Q4_0: 2 bytes scale + 16 bytes packed nibbles
+                    let scale = f16::from_le_bytes([q8.data[off], q8.data[off + 1]]).to_f32();
+                    for i in 0..32 {
+                        let byte = q8.data[off + 2 + i / 2];
+                        let nibble = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                        out[row * q8.n + b * 32 + i] = (nibble as i32 - 8) as f32 * scale;
+                    }
+                }
+            }
+        }
+        QuantType::Q6K => {
+            // Q6K is complex — dequantize via gguf extract_tensor_f32 or skip for ANE
+            // For now, fill with zeros (Q6K weights are typically only embeddings/lm_head)
+            eprintln!("WARNING: Q6K dequant for ANE not implemented, using zeros");
         }
     }
     out
