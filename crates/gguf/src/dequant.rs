@@ -86,43 +86,47 @@ pub fn dequant_q4_k_block(block: &[u8], out: &mut [f32]) {
 
 /// Dequantize Q6_K block to FP32.
 /// Q6_K format: 256 elements per block, 210 bytes per block
-/// Layout: 2 bytes (f16 d) + 2 bytes (f16 dmin) + 12 bytes (scales) + 2 bytes (padding) + 192 bytes (6-bit quants)
+/// Layout: ql[128] + qh[64] + scales[16] + d[2]
+/// - ql: lower 4 bits of each 6-bit quant (128 bytes)
+/// - qh: upper 2 bits of each 6-bit quant (64 bytes)  
+/// - scales: int8 scales, one per 16 elements (16 bytes)
+/// - d: fp16 super-block scale (2 bytes)
 pub fn dequant_q6_k_block(block: &[u8], out: &mut [f32]) {
     assert!(block.len() >= 210);
     assert!(out.len() >= 256);
 
-    let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
-    let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
-    let scales = &block[4..16];
-    let quants = &block[18..210];
+    let ql = &block[0..128];
+    let qh = &block[128..192];
+    let scales: &[i8] =
+        unsafe { std::slice::from_raw_parts(block[192..208].as_ptr() as *const i8, 16) };
+    let d = f16::from_le_bytes([block[208], block[209]]).to_f32();
 
-    for j in 0..8 {
-        let sc = scales[j] as f32;
-        let scale = d * sc;
-
-        // Each group of 32 elements uses 24 bytes (32 × 6 bits = 192 bits = 24 bytes)
-        let q_offset = j * 24;
+    for n in (0..256).step_by(128) {
+        let chunk = n / 128;
+        let ql_offset = chunk * 64;
+        let qh_offset = chunk * 32;
+        let sc_offset = chunk * 8;
 
         for l in 0..32 {
-            // Extract 6-bit value from the packed stream
-            let bit_offset = l * 6;
-            let byte_idx = q_offset + bit_offset / 8;
-            let bit_in_byte = bit_offset % 8;
+            let is = l / 16;
 
-            let val = if bit_in_byte <= 2 {
-                // Value fits in one byte
-                ((quants[byte_idx] >> bit_in_byte) & 0x3F) as i32
-            } else {
-                // Value spans two bytes
-                let lo = (quants[byte_idx] >> bit_in_byte) as u32;
-                let hi = quants[byte_idx + 1] as u32;
-                let val = lo | (hi << (8 - bit_in_byte));
-                (val & 0x3F) as i32
-            };
+            let q1 = ((ql[ql_offset + l] & 0x0F) as i32
+                | (((qh[qh_offset + l] >> 0) & 3) as i32) << 4)
+                - 32;
+            let q2 = ((ql[ql_offset + l + 32] & 0x0F) as i32
+                | (((qh[qh_offset + l] >> 2) & 3) as i32) << 4)
+                - 32;
+            let q3 = ((ql[ql_offset + l] >> 4) as i32
+                | (((qh[qh_offset + l] >> 4) & 3) as i32) << 4)
+                - 32;
+            let q4 = ((ql[ql_offset + l + 32] >> 4) as i32
+                | (((qh[qh_offset + l] >> 6) & 3) as i32) << 4)
+                - 32;
 
-            // 6-bit signed: subtract 32 to center
-            let signed_val = val - 32;
-            out[j * 32 + l] = signed_val as f32 * scale;
+            out[n + l + 0] = d * scales[sc_offset + is + 0] as f32 * q1 as f32;
+            out[n + l + 32] = d * scales[sc_offset + is + 2] as f32 * q2 as f32;
+            out[n + l + 64] = d * scales[sc_offset + is + 4] as f32 * q3 as f32;
+            out[n + l + 96] = d * scales[sc_offset + is + 6] as f32 * q4 as f32;
         }
     }
 }

@@ -517,7 +517,125 @@ fn cmd_bench(args: &[String]) -> Result<()> {
     let single_time = single_start.elapsed();
     let ms_per_token = single_time.as_secs_f64() * 1000.0;
     let ms_per_layer = ms_per_token / c.n_layers as f64;
-    eprintln!("  Single token: {ms_per_token:.1}ms ({ms_per_layer:.2}ms/layer)");
+    eprintln!(
+        "  Single token: {:.1}ms ({:.2}ms/layer)",
+        ms_per_token, ms_per_layer
+    );
+    eprintln!();
+
+    // === Benchmark 4: Speculative Decoding ===
+    eprintln!("── Benchmark: Speculative Decoding (CPU draft + CPU verify) ──");
+    const SPEC_K: usize = 4; // Draft K tokens
+    const SKIP_INTERVAL: usize = 2; // Run every 2nd layer for draft (better approximation)
+
+    // Reset caches
+    let mut draft_cache = ane_engine::deltanet_cache::HybridCache::new(&config);
+    let mut verify_cache = ane_engine::deltanet_cache::HybridCache::new(&config);
+
+    // Prefill both caches with prompt
+    let mut last_logits = vec![0.0f32; c.vocab_size];
+    for &tok in &prompt_tokens {
+        last_logits = qwen35_forward_token(&model, &mut draft_cache, tok)?;
+        let _ = qwen35_forward_token(&model, &mut verify_cache, tok)?;
+    }
+
+    let mut spec_tokens = Vec::new();
+    let mut total_draft_time = 0.0;
+    let mut total_verify_time = 0.0;
+    let mut total_accepted = 0usize;
+    let mut total_spec_cycles = 0usize;
+
+    let spec_start = Instant::now();
+
+    while spec_tokens.len() < n_gen {
+        // Draft K tokens
+        let draft_start = Instant::now();
+        let mut draft_tokens = Vec::with_capacity(SPEC_K);
+        let mut draft_logits = Vec::with_capacity(SPEC_K);
+        let mut current_logits = last_logits.clone();
+
+        for _ in 0..SPEC_K {
+            let next_token = greedy_sample(&current_logits, 0.0);
+            if tokenizer.is_eos(next_token) {
+                break;
+            }
+            draft_tokens.push(next_token);
+            current_logits =
+                draft_forward_skip_ffn(&model, &mut draft_cache, next_token)?;
+            draft_logits.push(current_logits.clone());
+        }
+        let draft_time = draft_start.elapsed();
+        total_draft_time += draft_time.as_secs_f64() * 1000.0;
+
+        if draft_tokens.is_empty() {
+            break;
+        }
+
+        // Verify K tokens + 1 bonus
+        let verify_start = Instant::now();
+        let mut accepted = 0usize;
+        let mut verify_logits = last_logits.clone();
+
+        for (i, &draft_tok) in draft_tokens.iter().enumerate() {
+            let verify_tok = greedy_sample(&verify_logits, 0.0);
+
+            if verify_tok == draft_tok {
+                // Accept
+                spec_tokens.push(draft_tok);
+                accepted += 1;
+                verify_logits = qwen35_forward_token(&model, &mut verify_cache, draft_tok)?;
+
+                // Sync draft cache with verify cache state
+                let _ = qwen35_forward_token(&model, &mut draft_cache, draft_tok)?;
+            } else {
+                // Reject: use verifier's token instead
+                spec_tokens.push(verify_tok);
+                verify_logits = qwen35_forward_token(&model, &mut verify_cache, verify_tok)?;
+
+                // Resync draft cache
+                let _ = qwen35_forward_token(&model, &mut draft_cache, verify_tok)?;
+                break;
+            }
+        }
+
+        // If all accepted, generate one bonus token from verifier
+        if accepted == draft_tokens.len() {
+            let bonus_tok = greedy_sample(&verify_logits, 0.0);
+            if !tokenizer.is_eos(bonus_tok) {
+                spec_tokens.push(bonus_tok);
+                verify_logits = qwen35_forward_token(&model, &mut verify_cache, bonus_tok)?;
+                let _ = qwen35_forward_token(&model, &mut draft_cache, bonus_tok)?;
+            }
+        }
+
+        let verify_time = verify_start.elapsed();
+        total_verify_time += verify_time.as_secs_f64() * 1000.0;
+
+        total_accepted += accepted;
+        total_spec_cycles += 1;
+        last_logits = verify_logits;
+
+        if spec_tokens.len() >= n_gen {
+            break;
+        }
+    }
+
+    let spec_total_time = spec_start.elapsed();
+    let spec_tok_s = spec_tokens.len() as f64 / spec_total_time.as_secs_f64();
+    let accept_rate = total_accepted as f64 / (total_spec_cycles * SPEC_K) as f64 * 100.0;
+
+    eprintln!("  Tokens: {}", spec_tokens.len());
+    eprintln!("  Cycles: {total_spec_cycles}");
+    eprintln!("  Accept rate: {accept_rate:.1}%");
+    eprintln!("  Draft time: {total_draft_time:.1}ms total");
+    eprintln!("  Verify time: {total_verify_time:.1}ms total");
+    eprintln!(
+        "  Total time: {:.1}ms",
+        spec_total_time.as_secs_f64() * 1000.0
+    );
+    eprintln!("  Speed: {spec_tok_s:.1} tok/s (Speculative)");
+    let spec_speedup = spec_tok_s / tg_tok_s;
+    eprintln!("  Speedup vs CPU: {spec_speedup:.1}x");
     eprintln!();
 
     // === Summary ===
@@ -887,6 +1005,87 @@ fn qwen35_forward_token(
                 let ffn_out = ffn_forward(&ffn_in, &lw.ffn, dim, hidden_dim);
                 for i in 0..dim {
                     x[i] += ffn_out[i];
+                }
+            }
+        }
+    }
+
+    let mut final_out = vec![0.0f32; dim];
+    rmsnorm_vec(&mut final_out, &x, &model.final_norm, eps);
+
+    let mut logits = vec![0.0f32; c.vocab_size];
+    ane_engine::q8_gemv::q8_gemv(&model.lm_head, &final_out, &mut logits);
+
+    cache.advance(1);
+    Ok(logits)
+}
+
+/// Draft forward with FFN skipping for speculative decoding.
+/// Runs all attention layers but skips FFN in half the layers.
+/// This preserves recurrent state while reducing computation.
+fn draft_forward_skip_ffn(
+    model: &ane_engine::model::Qwen35ModelWeights,
+    cache: &mut ane_engine::deltanet_cache::HybridCache,
+    token_id: u32,
+) -> Result<Vec<f32>> {
+    use ane_engine::deltanet;
+    use ane_engine::model::*;
+
+    let c = &model.config.base;
+    let dim = c.dim;
+    let hidden_dim = c.hidden_dim;
+    let eps = c.rms_norm_eps;
+
+    let mut x = vec![0.0f32; dim];
+    let tok = token_id as usize;
+    if tok < c.vocab_size {
+        x.copy_from_slice(&model.embedding[tok * dim..(tok + 1) * dim]);
+    }
+
+    // Run all layers, skip FFN in half of them
+    for (l, layer) in model.layers.iter().enumerate() {
+        let (_layer_type, local_idx) = cache.layer_map[l];
+        let skip_ffn = l % 2 == 0; // Skip FFN in even layers
+
+        match layer {
+            HybridLayerWeights::DeltaNet(lw) => {
+                let mut xnorm = vec![0.0f32; dim];
+                rmsnorm_vec(&mut xnorm, &x, &lw.attn_norm, eps);
+
+                let state = &mut cache.deltanet_states[local_idx];
+                let attn_out = deltanet::deltanet_decode_step(&xnorm, state, lw, eps);
+
+                for i in 0..dim {
+                    x[i] += attn_out[i];
+                }
+
+                if !skip_ffn {
+                    let mut ffn_in = vec![0.0f32; dim];
+                    rmsnorm_vec(&mut ffn_in, &x, &lw.post_attn_norm, eps);
+                    let ffn_out = ffn_forward(&ffn_in, &lw.ffn, dim, hidden_dim);
+                    for i in 0..dim {
+                        x[i] += ffn_out[i];
+                    }
+                }
+            }
+            HybridLayerWeights::FullAttention(lw) => {
+                let mut xnorm = vec![0.0f32; dim];
+                rmsnorm_vec(&mut xnorm, &x, &lw.attn_norm, eps);
+
+                let kv_cache = &mut cache.kv_caches[local_idx];
+                let attn_out = deltanet::full_attn_decode_step(&xnorm, cache.pos, kv_cache, lw, c);
+
+                for i in 0..dim {
+                    x[i] += attn_out[i];
+                }
+
+                if !skip_ffn {
+                    let mut ffn_in = vec![0.0f32; dim];
+                    rmsnorm_vec(&mut ffn_in, &x, &lw.post_attn_norm, eps);
+                    let ffn_out = ffn_forward(&ffn_in, &lw.ffn, dim, hidden_dim);
+                    for i in 0..dim {
+                        x[i] += ffn_out[i];
+                    }
                 }
             }
         }
