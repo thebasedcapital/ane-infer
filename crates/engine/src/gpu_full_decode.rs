@@ -1002,19 +1002,11 @@ pub fn encode_full_token_gpu(
     }
 
     // --- Final: LM head GEMV ---
-    // RMSNorm hidden → input (final_norm uploaded once as scratch buffer)
-    // TODO: pre-upload final_norm at model load to avoid per-token alloc
     {
-        let final_norm = &model.final_norm;
-        let fn_buf = gpu.device.new_buffer_with_data(
-            final_norm.as_ptr() as *const _,
-            (final_norm.len() * 4) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
         let enc = cmd_buf.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&gpu.rmsnorm_simple_pipeline);
         enc.set_buffer(0, Some(&scratch.hidden), 0);
-        enc.set_buffer(1, Some(&fn_buf), 0);
+        enc.set_buffer(1, Some(&gpu_weights.final_norm_buf), 0);
         enc.set_buffer(2, Some(&gpu.scratch_input), 0);
         enc.set_buffer(3, Some(&cp.buf), GpuConstantPool::DIM as u64);
         enc.set_buffer(4, Some(&cp.buf), GpuConstantPool::EPS as u64);

@@ -146,6 +146,7 @@ pub struct GpuModelWeights {
     pub layers: Vec<GpuLayerWeights>,
     pub lm_head: GpuBuffer,
     pub lm_head_params: metal::Buffer,
+    pub final_norm_buf: metal::Buffer,
 }
 
 pub fn upload_model_weights(gpu: &GpuContext, model: &Qwen35ModelWeights) -> GpuModelWeights {
@@ -267,11 +268,17 @@ pub fn upload_model_weights(gpu: &GpuContext, model: &Qwen35ModelWeights) -> Gpu
 
     let lm_head = gpu.upload_q8_weights(&model.lm_head);
     let lm_head_params = make_gemv_params(&gpu.device, &lm_head);
+    let final_norm_buf = gpu.device.new_buffer_with_data(
+        model.final_norm.as_ptr() as *const _,
+        (model.final_norm.len() * 4) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
 
     GpuModelWeights {
         layers,
         lm_head,
         lm_head_params,
+        final_norm_buf,
     }
 }
 
