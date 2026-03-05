@@ -8,7 +8,7 @@ use half::f16;
 
 /// Dequantize Q4_0 block to FP32.
 /// Block format: 2 bytes (f16 scale) + 16 bytes (32 × 4-bit values)
-/// Each 4-bit value is signed: value - 8
+/// GGUF layout: elements 0-15 = low nibbles of bytes 0-15, elements 16-31 = high nibbles
 pub fn dequant_q4_0_block(block: &[u8], out: &mut [f32]) {
     assert!(block.len() >= 18);
     assert!(out.len() >= 32);
@@ -17,10 +17,10 @@ pub fn dequant_q4_0_block(block: &[u8], out: &mut [f32]) {
 
     for i in 0..16 {
         let byte = block[2 + i];
-        let lo = (byte & 0x0F) as i32 - 8;
-        let hi = ((byte >> 4) & 0x0F) as i32 - 8;
-        out[i * 2] = lo as f32 * scale;
-        out[i * 2 + 1] = hi as f32 * scale;
+        // Low nibble → element i
+        out[i] = ((byte & 0x0F) as i32 - 8) as f32 * scale;
+        // High nibble → element i + 16
+        out[i + 16] = (((byte >> 4) & 0x0F) as i32 - 8) as f32 * scale;
     }
 }
 
