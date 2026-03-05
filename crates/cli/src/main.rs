@@ -209,8 +209,9 @@ fn cmd_bench_ane() -> Result<()> {
         ("proc1".into(), dim, dim, spatial, 64u64), // same weights, different procedure
     ];
     let multi_mil = mil_gen::mil_gen_multi_procedure(&procs);
-    let multi_kernel = ane_bridge::AneKernel::compile(&multi_mil, Some(&blob), &[in_bytes], &[out_bytes])
-        .context("Multi-procedure compilation failed")?;
+    let multi_kernel =
+        ane_bridge::AneKernel::compile(&multi_mil, Some(&blob), &[in_bytes], &[out_bytes])
+            .context("Multi-procedure compilation failed")?;
 
     let n_procs = multi_kernel.num_procedures();
     eprintln!("  Procedures detected: {n_procs}");
@@ -238,7 +239,10 @@ fn cmd_bench_ane() -> Result<()> {
     }
     let elapsed2 = start2.elapsed();
     let ms_per_pair = elapsed2.as_secs_f64() * 1000.0 / n_iters as f64;
-    eprintln!("  2-proc sequential: {ms_per_pair:.3}ms/pair ({:.3}ms/proc)", ms_per_pair / 2.0);
+    eprintln!(
+        "  2-proc sequential: {ms_per_pair:.3}ms/pair ({:.3}ms/proc)",
+        ms_per_pair / 2.0
+    );
 
     Ok(())
 }
@@ -421,12 +425,21 @@ fn cmd_bench(args: &[String]) -> Result<()> {
                 gpu_upload_start.elapsed().as_secs_f64() * 1000.0
             );
 
-            let gpu_scratch = ane_engine::gpu_full_decode::GpuLayerScratch::new(
-                &gpu.device, c.dim, c.hidden_dim, c.dim * 3, 16,
+            let mut gpu_scratch = ane_engine::gpu_full_decode::GpuLayerScratch::new(
+                &gpu.device,
+                c.dim,
+                c.hidden_dim,
+                c.dim * 3,
+                16,
             );
             let gpu_cp = ane_engine::gpu_full_decode::GpuConstantPool::new(
-                &gpu.device, c.dim, c.hidden_dim, c.dim * 3, 16,
-                config.ssm_state_size, 4, // kernel_size=4 default
+                &gpu.device,
+                c.dim,
+                c.hidden_dim,
+                c.dim * 3,
+                16,
+                config.ssm_state_size,
+                4, // kernel_size=4 default
                 c.rms_norm_eps,
             );
 
@@ -434,12 +447,22 @@ fn cmd_bench(args: &[String]) -> Result<()> {
 
             // Warmup
             let _ = ane_engine::gpu_full_decode::encode_full_token_gpu(
-                &gpu, &model, &gpu_weights, &gpu_scratch, &gpu_cp, first_token,
+                &gpu,
+                &model,
+                &gpu_weights,
+                &mut gpu_scratch,
+                &gpu_cp,
+                first_token,
             );
 
             let mut gen_gpu = vec![first_token];
             let mut last_logits_gpu = ane_engine::gpu_full_decode::encode_full_token_gpu(
-                &gpu, &model, &gpu_weights, &gpu_scratch, &gpu_cp, first_token,
+                &gpu,
+                &model,
+                &gpu_weights,
+                &mut gpu_scratch,
+                &gpu_cp,
+                first_token,
             )?;
 
             let gpu_start = Instant::now();
@@ -450,7 +473,12 @@ fn cmd_bench(args: &[String]) -> Result<()> {
                 }
                 gen_gpu.push(next);
                 last_logits_gpu = ane_engine::gpu_full_decode::encode_full_token_gpu(
-                    &gpu, &model, &gpu_weights, &gpu_scratch, &gpu_cp, next,
+                    &gpu,
+                    &model,
+                    &gpu_weights,
+                    &mut gpu_scratch,
+                    &gpu_cp,
+                    next,
                 )?;
             }
             let gpu_time = gpu_start.elapsed();
