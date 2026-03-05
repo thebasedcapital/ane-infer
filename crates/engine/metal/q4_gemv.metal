@@ -96,3 +96,43 @@ kernel void q4_gemv(
         }
     }
 }
+
+// Simple Q4_0 GEMV: 1 thread per output row, no threadgroup sync
+// GGUF Q4_0 format:
+//   elements 0-15  = low nibbles  of bytes 0-15
+//   elements 16-31 = high nibbles of bytes 0-15
+kernel void q4_gemv_simple(
+    device const block_q4_0 * W [[buffer(0)]],
+    device const float      * x [[buffer(1)]],
+    device       float      * y [[buffer(2)]],
+    constant uint & n_blocks      [[buffer(3)]],
+    constant uint & m             [[buffer(4)]],
+    uint tid [[thread_position_in_grid]])
+{
+    const int row = int(tid);
+    if (row >= int(m)) return;
+
+    const int nb = int(n_blocks);
+    device const block_q4_0 * w_row = W + row * nb;
+
+    float sum = 0.0f;
+
+    for (int b = 0; b < nb; ++b) {
+        const float scale = float(w_row[b].d);
+        device const uint8_t * qs = w_row[b].qs;
+        device const float * xb = x + b * 32;
+
+        // Elements 0-15: low nibbles
+        for (int i = 0; i < 16; ++i) {
+            float v = float(qs[i] & 0x0F) - 8.0f;
+            sum += v * scale * xb[i];
+        }
+        // Elements 16-31: high nibbles
+        for (int i = 0; i < 16; ++i) {
+            float v = float((qs[i] >> 4) & 0x0F) - 8.0f;
+            sum += v * scale * xb[16 + i];
+        }
+    }
+
+    y[row] = sum;
+}

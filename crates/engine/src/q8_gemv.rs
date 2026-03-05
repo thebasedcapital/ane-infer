@@ -87,9 +87,10 @@ fn compute_row_q4(data: &[u8], x: &[f32], row: usize, bpr: usize) -> f32 {
         let mut block_sum = 0.0f32;
         for i in 0..16 {
             let packed = data[off + 2 + i];
-            let v0 = q4_unpack(packed, 0);
-            let v1 = q4_unpack(packed, 1);
-            block_sum += v0 * x[b * 32 + i * 2] + v1 * x[b * 32 + i * 2 + 1];
+            // GGUF Q4_0: low nibble = element i, high nibble = element i+16
+            let v0 = q4_unpack(packed, 0); // low nibble → element i
+            let v1 = q4_unpack(packed, 1); // high nibble → element i+16
+            block_sum += v0 * x[b * 32 + i] + v1 * x[b * 32 + 16 + i];
         }
         sum += block_sum * scale;
     }

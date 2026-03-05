@@ -51,6 +51,7 @@ pub struct GpuContext {
     pub queue: CommandQueue,
     pub gemv_pipeline: ComputePipelineState,
     pub q4_gemv_pipeline: ComputePipelineState,
+    pub q4_gemv_simple_pipeline: ComputePipelineState,
     pub silu_pipeline: ComputePipelineState,
     // DeltaNet recurrence shaders
     pub conv1d_silu_pipeline: ComputePipelineState,
@@ -95,6 +96,13 @@ impl GpuContext {
         let q4_gemv_pipeline = device
             .new_compute_pipeline_state_with_function(&q4_gemv_fn)
             .map_err(|e| anyhow::anyhow!("q4_gemv pipeline creation failed: {e}"))?;
+
+        let q4_gemv_simple_fn = library
+            .get_function("q4_gemv_simple", None)
+            .map_err(|e| anyhow::anyhow!("q4_gemv_simple not found: {e}"))?;
+        let q4_gemv_simple_pipeline = device
+            .new_compute_pipeline_state_with_function(&q4_gemv_simple_fn)
+            .map_err(|e| anyhow::anyhow!("q4_gemv_simple pipeline creation failed: {e}"))?;
 
         let silu_fn = library
             .get_function("silu_mul", None)
@@ -146,6 +154,7 @@ impl GpuContext {
             queue,
             gemv_pipeline,
             q4_gemv_pipeline,
+            q4_gemv_simple_pipeline,
             silu_pipeline,
             conv1d_silu_pipeline,
             l2_norm_scale_pipeline,

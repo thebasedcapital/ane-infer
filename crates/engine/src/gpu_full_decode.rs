@@ -1057,27 +1057,47 @@ fn encode_gemv_prealloc(
 ) {
     let m = weight.m as u32;
     let enc = cmd_buf.new_compute_command_encoder();
-    // Select pipeline based on quantization type
-    let pipeline = match weight.quant_type {
-        crate::q8_gemv::QuantType::Q8_0 => &gpu.gemv_pipeline,
-        crate::q8_gemv::QuantType::Q4_0 => &gpu.q4_gemv_pipeline,
-        crate::q8_gemv::QuantType::Q6K => {
-            // Q6K not supported on GPU - will need CPU fallback
-            // For now, use Q8 pipeline (incorrect but allows loading)
-            // TODO: Implement proper Q6K GPU kernel or CPU fallback
-            &gpu.gemv_pipeline
+
+    match weight.quant_type {
+        crate::q8_gemv::QuantType::Q8_0 => {
+            enc.set_compute_pipeline_state(&gpu.gemv_pipeline);
+            enc.set_buffer(0, Some(&weight.buffer), 0);
+            enc.set_buffer(1, Some(input_buf), (input_offset * 4) as u64);
+            enc.set_buffer(2, Some(output_buf), (output_offset * 4) as u64);
+            enc.set_buffer(3, Some(params_buf), 0);
+            enc.set_buffer(4, Some(params_buf), 4);
+            // NR0=2: each threadgroup handles 2 output rows
+            enc.dispatch_thread_groups(
+                MTLSize::new(((m as u64) + 1) / 2, 1, 1),
+                MTLSize::new(128, 1, 1),
+            );
         }
-    };
-    enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(&weight.buffer), 0);
-    enc.set_buffer(1, Some(input_buf), (input_offset * 4) as u64);
-    enc.set_buffer(2, Some(output_buf), (output_offset * 4) as u64);
-    enc.set_buffer(3, Some(params_buf), 0);
-    enc.set_buffer(4, Some(params_buf), 4);
-    // NR0=2: each threadgroup handles 2 output rows, so dispatch half as many
-    enc.dispatch_thread_groups(
-        MTLSize::new(((m as u64) + 1) / 2, 1, 1),
-        MTLSize::new(128, 1, 1),
-    );
+        crate::q8_gemv::QuantType::Q4_0 => {
+            // NR0=2 tiled kernel is faster than simple 1-thread-per-row (38 vs 34 tok/s)
+            enc.set_compute_pipeline_state(&gpu.q4_gemv_pipeline);
+            enc.set_buffer(0, Some(&weight.buffer), 0);
+            enc.set_buffer(1, Some(input_buf), (input_offset * 4) as u64);
+            enc.set_buffer(2, Some(output_buf), (output_offset * 4) as u64);
+            enc.set_buffer(3, Some(params_buf), 0);
+            enc.set_buffer(4, Some(params_buf), 4);
+            enc.dispatch_thread_groups(
+                MTLSize::new(((m as u64) + 1) / 2, 1, 1),
+                MTLSize::new(128, 1, 1),
+            );
+        }
+        crate::q8_gemv::QuantType::Q6K => {
+            // Q6K not supported on GPU - use Q8 as fallback (incorrect)
+            enc.set_compute_pipeline_state(&gpu.gemv_pipeline);
+            enc.set_buffer(0, Some(&weight.buffer), 0);
+            enc.set_buffer(1, Some(input_buf), (input_offset * 4) as u64);
+            enc.set_buffer(2, Some(output_buf), (output_offset * 4) as u64);
+            enc.set_buffer(3, Some(params_buf), 0);
+            enc.set_buffer(4, Some(params_buf), 4);
+            enc.dispatch_thread_groups(
+                MTLSize::new(((m as u64) + 1) / 2, 1, 1),
+                MTLSize::new(128, 1, 1),
+            );
+        }
+    }
     enc.end_encoding();
 }
