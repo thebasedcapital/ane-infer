@@ -497,6 +497,8 @@ fn cmd_bench(args: &[String]) -> Result<()> {
             eprintln!("  Speed: {gpu_tok_s:.1} tok/s (GPU Full tg{gpu_tg})");
             let cpu_speedup = gpu_tok_s / tg_tok_s;
             eprintln!("  Speedup vs CPU: {cpu_speedup:.1}x");
+            let gpu_text = tokenizer.decode(&gen_gpu);
+            eprintln!("  GPU output: {gpu_text}");
             eprintln!();
         }
         Err(e) => {
